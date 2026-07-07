@@ -36,4 +36,5 @@ __pycache__/
 
 # Logs
 *.log
+budget/
 
