@@ -1,0 +1,31 @@
+{
+  "drive_folder_id": "1B_c_2JMfxoORKNyf3Gx7qIxHX54GKkGX",
+  "analyzed_at": "2026-07-02T15:08:04.189276Z",
+  "image_count": 107,
+  "analyzed_count": 30,
+  "filtered_count": 26,
+  "photography_style": "Clean, professional architectural and product photography documenting installed garage doors across residential and commercial settings, mixed with occasional candid service-technician portraits.",
+  "lighting": "Predominantly natural daylight with bright blue skies; frequent twilight/dusk exteriors with warm glowing accent lighting; clean, even artificial lighting in interior and warehouse shots.",
+  "composition": "Straight-on and slightly angled eye-level exterior facade shots emphasizing the garage door as hero; wide-angle framing that captures the full home or building; balanced, symmetrical compositions; tight close-ups for technician/hands-on service moments.",
+  "typical_scenarios": [
+    "Upscale suburban homes showcasing residential garage doors",
+    "Modern architectural homes at dusk with warm interior/accent lighting",
+    "Commercial warehouse and rolling-door interiors and exteriors",
+    "Fire stations and municipal buildings with bay doors",
+    "Technician servicing or installing a door opener up close",
+    "Branded service pickup truck with uniformed representative",
+    "Stadium and industrial roll-up counter shutters",
+    "Multi-bay garages with clean driveways and manicured landscaping"
+  ],
+  "color_palette": [
+    "Sky blue",
+    "Warm neutral beige/tan",
+    "Crisp white",
+    "Charcoal gray",
+    "Warm wood brown",
+    "Signature red (brand accent)"
+  ],
+  "prompt_guidelines": "Photograph installed garage doors as the clear hero of the image, shot straight-on or at a slight angle at eye level. Use bright natural daylight with clear blue skies for daytime exteriors, or shoot at dusk/twilight with warm glowing interior and sconce lighting for a premium mood. Frame wide enough to show the full home facade, driveway, and tidy landscaping, or the full commercial building bay. Keep compositions balanced and clean with well-maintained, upscale residential and professional commercial environments. Match a color mood of warm neutrals, crisp whites, natural wood tones, and blue skies, with occasional bold red brand accents. For service scenes, show a uniformed technician working hands-on with a door or opener in close-up, or a friendly representative beside a branded white pickup truck. Avoid heavy HDR over-processing, artificial studio backdrops, cluttered scenes, dramatic filters, fisheye distortion, and any dirty or run-down settings. Aim for polished, realistic architectural photography that looks professionally shot on location.",
+  "style_description": "The brand's visual identity centers on clean, aspirational architectural photography that positions the garage door as the focal point of well-kept homes and professional commercial buildings. Imagery balances bright, blue-sky daytime shots with warm, inviting dusk exteriors that convey quality and craftsmanship. The aesthetic feels premium yet approachable, reinforced by candid hands-on service moments and a recognizable red brand accent. Overall the look is trustworthy, established, and detail-oriented.",
+  "version": "1.0"
+}

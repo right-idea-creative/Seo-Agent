@@ -1,0 +1,25 @@
+{
+  "client_id": "example",
+  "website_id": "example-website",
+  "drive_folder_id": "1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgVE2upms",
+  "analyzed_at": "2026-01-01T00:00:00Z",
+  "image_count": 45,
+  "photography_style": "Professional service photography, natural light, outdoor and indoor garage environments",
+  "typical_scenarios": [
+    "Technician working on residential garage door",
+    "Close-up of garage door hardware and springs",
+    "Team photo outside client homes",
+    "Before/after repair results",
+    "Tools and equipment laid out professionally"
+  ],
+  "color_palette": [
+    "#2C3E50",
+    "#E8E0D5",
+    "#F39C12",
+    "#FFFFFF",
+    "#7F8C8D"
+  ],
+  "prompt_guidelines": "Professional photograph taken in natural daylight. Workers wear dark work uniforms. Residential garage setting, suburban homes in background. Clean, uncluttered composition. Warm but neutral tones. Shallow depth of field, 35mm lens. Documentary style — authentic workplace, not staged.",
+  "style_description": "The brand's photography conveys trust and professionalism through real on-site images. Technicians are always shown actively working, never posed. The color palette is muted and earthy, letting the work speak for itself. Images feel authentic and relatable to homeowners.",
+  "version": "1.0"
+}

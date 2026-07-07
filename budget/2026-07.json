@@ -1,0 +1,14 @@
+{
+  "month": "2026-07",
+  "claude": {
+    "calls": 66,
+    "input_tokens": 251031,
+    "output_tokens": 81864,
+    "usd": 3.301755
+  },
+  "openai": {
+    "calls": 0,
+    "images": 0,
+    "usd": 0.0
+  }
+}

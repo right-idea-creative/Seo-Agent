@@ -1,0 +1,39 @@
+# Environment
+.env
+.env.local
+
+# Credentials
+credentials/
+!credentials/README.md
+!credentials/example.json
+!credentials/.gitignore
+
+# Output
+output/
+
+# Indexes / databases
+index/
+*.db
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# macOS
+.DS_Store
+.AppleDouble
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Claude
+.claude/
+
+# Logs
+*.log
+
