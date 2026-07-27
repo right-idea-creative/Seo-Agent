@@ -6,10 +6,11 @@ logger = logging.getLogger(__name__)
 
 # Claude Opus 4.8 pricing (per million tokens)
 _CLAUDE_INPUT_PRICE_PER_M = 5.00
-_CLAUDE_OUTPUT_PRICE_PER_M = 25.00
+_CLAUDE_OUTPUT_PRICE_PER_M = 10
 
-# OpenAI DALL-E 3 HD pricing (1792×1024, quality="hd" — the size used by this pipeline)
-_OPENAI_IMAGE_PRICE = 0.12
+# OpenAI gpt-image-1 pricing (1536×1024, quality="high").
+# Token-based: ~6208 output image tokens × $40/1M + ~100 input tokens × $5/1M ≈ $0.25/image.
+_OPENAI_IMAGE_PRICE = 0.25
 
 
 class BudgetExceededError(Exception):
@@ -59,6 +60,21 @@ class BudgetService:
                 f"OpenAI monthly budget exceeded: ${spent:.2f} / ${self._openai_limit:.2f}. "
                 "AI image generation will be skipped this month."
             )
+
+    def check_monthly_total(self, max_usd: float) -> None:
+        """Raise BudgetExceededError if combined Claude + OpenAI spend meets or exceeds max_usd."""
+        data = self._load()
+        total = data["claude"]["usd"] + data["openai"]["usd"]
+        if total >= max_usd:
+            raise BudgetExceededError(
+                f"Monthly budget exceeded: ${total:.2f} spent / ${max_usd:.2f} limit. "
+                "Article generation is blocked until the next billing month."
+            )
+
+    def total_spent(self) -> float:
+        """Return combined Claude + OpenAI spend for the current month."""
+        data = self._load()
+        return round(data["claude"]["usd"] + data["openai"]["usd"], 6)
 
     def record_claude(self, input_tokens: int, output_tokens: int) -> None:
         """Record a Claude API call and persist the updated totals."""

@@ -1,24 +1,24 @@
 import logging
+import time
 from typing import Any
 
 import anthropic
 
+import services.call_tracer as call_tracer
 from config import settings
 from services.budget_service import BudgetService
+from services.llm_errors import (
+    ClaudeAPIError,
+    ClaudeRateLimitError,
+    ClaudeServiceError,
+)
 
 logger = logging.getLogger(__name__)
 
-
-# ── Exceptions ────────────────────────────────────────────────────────────────
-
-class ClaudeServiceError(Exception):
-    """Base exception for all Claude service errors."""
-
-class ClaudeRateLimitError(ClaudeServiceError):
-    """Raised when the Anthropic API rate limit is exceeded."""
-
-class ClaudeAPIError(ClaudeServiceError):
-    """Raised when the API returns an unexpected or unrecoverable error."""
+# Re-export error types so existing callers that do:
+#   from services.claude_service import ClaudeAPIError
+# continue to work without changes.
+__all__ = ["ClaudeService", "ClaudeServiceError", "ClaudeRateLimitError", "ClaudeAPIError"]
 
 
 # ── Service ───────────────────────────────────────────────────────────────────
@@ -49,6 +49,14 @@ class ClaudeService:
     def model(self) -> str:
         return self._model
 
+    @property
+    def provider(self) -> str:
+        return "anthropic"
+
+    @property
+    def budget(self) -> "BudgetService | None":
+        return self._budget
+
     # ── Public interface ──────────────────────────────────────────────────────
 
     def generate(
@@ -58,6 +66,8 @@ class ClaudeService:
         *,
         max_tokens: int = 8096,
         thinking: bool = True,
+        model: str | None = None,
+        label: str = "",
     ) -> str:
         """
         Stream a text response and return it in full.
@@ -78,17 +88,38 @@ class ClaudeService:
             ClaudeRateLimitError: API rate limit exceeded.
             ClaudeAPIError:       Any other API or SDK error.
         """
-        kwargs = self._base_kwargs(system, messages, max_tokens, thinking)
+        kwargs = self._base_kwargs(system, messages, max_tokens, thinking, model)
+        effective_model = kwargs["model"]
 
         if self._budget is not None:
             self._budget.check_claude()
 
+        t0 = time.perf_counter()
         try:
             with self._client.messages.stream(**kwargs) as stream:
                 final = stream.get_final_message()
 
+            duration = time.perf_counter() - t0
+
             if self._budget is not None and final.usage:
                 self._budget.record_claude(final.usage.input_tokens, final.usage.output_tokens)
+
+            if final.usage:
+                thinking_tokens = getattr(final.usage, "thinking_tokens", None)
+                logger.debug(
+                    "generate() usage — stop_reason=%s  input=%d  thinking=%s  output=%d",
+                    final.stop_reason,
+                    final.usage.input_tokens,
+                    thinking_tokens if thinking_tokens is not None else "n/a",
+                    final.usage.output_tokens,
+                )
+                call_tracer.record(
+                    stage=label or "claude:generate",
+                    model=effective_model,
+                    input_tokens=final.usage.input_tokens,
+                    output_tokens=final.usage.output_tokens,
+                    duration_s=duration,
+                )
 
             for block in final.content:
                 if block.type == "text":
@@ -102,7 +133,7 @@ class ClaudeService:
 
         except anthropic.APIError as exc:
             logger.error("Claude API error: %s", exc)
-            raise ClaudeAPIError(str(exc)) from exc
+            raise ClaudeAPIError(str(exc), status_code=getattr(exc, "status_code", None)) from exc
 
     def generate_structured(
         self,
@@ -114,6 +145,8 @@ class ClaudeService:
         *,
         max_tokens: int = 4096,
         thinking: bool = True,
+        model: str | None = None,
+        label: str = "",
     ) -> dict[str, Any]:
         """
         Force a tool_use call and return the structured input dict.
@@ -137,7 +170,8 @@ class ClaudeService:
             ClaudeRateLimitError: API rate limit exceeded.
             ClaudeAPIError:       Tool not called or any other API error.
         """
-        kwargs = self._base_kwargs(system, messages, max_tokens, thinking)
+        kwargs = self._base_kwargs(system, messages, max_tokens, thinking, model)
+        effective_model = kwargs["model"]
         kwargs["tools"] = [
             {
                 "name": tool_name,
@@ -150,11 +184,22 @@ class ClaudeService:
         if self._budget is not None:
             self._budget.check_claude()
 
+        t0 = time.perf_counter()
         try:
             response = self._client.messages.create(**kwargs)
+            duration = time.perf_counter() - t0
 
             if self._budget is not None and response.usage:
                 self._budget.record_claude(response.usage.input_tokens, response.usage.output_tokens)
+
+            if response.usage:
+                call_tracer.record(
+                    stage=label or "claude:structured",
+                    model=effective_model,
+                    input_tokens=response.usage.input_tokens,
+                    output_tokens=response.usage.output_tokens,
+                    duration_s=duration,
+                )
 
             for block in response.content:
                 if block.type == "tool_use" and block.name == tool_name:
@@ -171,7 +216,7 @@ class ClaudeService:
 
         except anthropic.APIError as exc:
             logger.error("Claude API error: %s", exc)
-            raise ClaudeAPIError(str(exc)) from exc
+            raise ClaudeAPIError(str(exc), status_code=getattr(exc, "status_code", None)) from exc
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 
@@ -181,9 +226,10 @@ class ClaudeService:
         messages: list[dict[str, Any]],
         max_tokens: int,
         thinking: bool,
+        model: str | None = None,
     ) -> dict[str, Any]:
         kwargs: dict[str, Any] = {
-            "model": self._model,
+            "model": model or self._model,
             "max_tokens": max_tokens,
             "system": system,
             "messages": messages,
@@ -203,4 +249,13 @@ budget = BudgetService(
     settings.openai_monthly_budget_usd,
 )
 
-claude = ClaudeService(budget=budget)
+_primary = ClaudeService(budget=budget)
+
+if settings.openai_api_key:
+    from services.openai_generation_service import OpenAIGenerationService
+    _fallback = OpenAIGenerationService(api_key=settings.openai_api_key)
+else:
+    _fallback = None
+
+from services.llm_gateway import LLMGateway
+claude = LLMGateway(primary=_primary, fallback=_fallback)

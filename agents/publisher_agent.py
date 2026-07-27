@@ -4,8 +4,6 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
-import markdown as md_parser
-
 from config import settings
 from models.article import Article
 from models.enums import ArticleStatus, SEOPlugin
@@ -15,7 +13,7 @@ from services.seo_qa_service import SEOQAService
 from services.wordpress_service import WordPressService
 
 if TYPE_CHECKING:
-    from models.image_request import ImagePlacementPlan, ImagePurpose, ImageRequest
+    from models.image_request import ImagePurpose, ImageRequest
 
 logger = logging.getLogger(__name__)
 
@@ -152,6 +150,7 @@ class PublisherAgent:
 
     def __init__(self, service: WordPressService) -> None:
         self._service = service
+        self.last_qa_report: SEOReport | None = None
 
     # ── Public interface ──────────────────────────────────────────────────────
 
@@ -176,6 +175,11 @@ class PublisherAgent:
             issues.append("seo.slug is empty")
         if not article.seo.focus_keyword.strip():
             issues.append("seo.focus_keyword is empty")
+        if not article.request.location or not article.request.location.city:
+            issues.append(
+                "location is missing — publishing a local SEO article without a city/state "
+                "is blocked. Re-generate with --city/--state or create a site profile."
+            )
 
         return issues
 
@@ -256,7 +260,6 @@ class PublisherAgent:
         article: Article,
         *,
         min_score: int | None = None,
-        image_plan: "ImagePlacementPlan | None" = None,
         uploaded_images: "list[tuple[ImageRequest, ImageMetadata]] | None" = None,
         update_post_id: int | None = None,
         link_enricher: "Any | None" = None,
@@ -267,12 +270,15 @@ class PublisherAgent:
         By default, always creates a NEW post. Pass update_post_id to update
         an existing WordPress post instead.
 
+        article.content_markdown is the single source of truth for the body.
+        Image placement markers (<!-- SEO_AGENT_IMAGE: id -->) must already be
+        embedded in content_markdown before this method is called — the pipeline
+        in main.py merges them in immediately after image planning.
+
         Args:
-            article:         The article to publish.
+            article:         The article to publish. content_markdown must include
+                             any inline image markers before this is called.
             min_score:       Minimum SEO QA score (overrides settings default).
-            image_plan:      Optional plan from ImageResolverAgent. When provided,
-                             modified_markdown (which contains inline image markers)
-                             is used instead of content_markdown.
             uploaded_images: (ImageRequest, ImageMetadata) pairs from MediaService.
                              Inline images replace their markers in the HTML;
                              the first FEATURED image sets featured_media on the post.
@@ -296,23 +302,72 @@ class PublisherAgent:
 
         # ── SEO QA gate ───────────────────────────────────────
         qa_report = SEOQAService().analyze(article)
+        self.last_qa_report = qa_report
         if qa_report.summary.critical > 0 or qa_report.score < effective_min_score:
             raise SEOQualityError(qa_report, effective_min_score)
 
         logger.info("Publishing article '%s' (QA score: %d/100)", article.title, qa_report.score)
+
+        # ── Mandatory image gate ──────────────────────────────
+        if article.image_plans:
+            resolved_ids = {req.id for req, _ in (uploaded_images or [])}
+            missing_mandatory = [
+                p for p in article.image_plans
+                if p.mandatory and p.image_id not in resolved_ids
+            ]
+            if missing_mandatory:
+                ids = ", ".join(p.image_id for p in missing_mandatory)
+                raise ValueError(
+                    f"Publish blocked — {len(missing_mandatory)} mandatory image(s) not resolved: {ids}.\n"
+                    "Every planned mandatory image must be resolved before publishing. "
+                    "Check Drive for matching photos or verify the image resolution pipeline."
+                )
 
         # Resolve effective SEO plugin (auto-detect if not configured)
         effective_plugin = self.resolve_seo_plugin(article.publishing.seo_plugin)
         if effective_plugin != SEOPlugin.NONE:
             logger.info("SEO plugin active: %s", effective_plugin.value)
 
-        # Use modified_markdown (with markers) when a plan is provided
-        markdown_source = image_plan.modified_markdown if image_plan else article.content_markdown
+        markdown_source = article.content_markdown
 
         # Enrich with internal links before HTML conversion
         if link_enricher is not None:
             posts = self._service.list_posts()
             markdown_source = link_enricher.enrich(article, posts, markdown_source)
+
+        # Editorial placement: strip resolver marker positions and recompute
+        # optimal positions for every inline image according to editorial rules.
+        if uploaded_images:
+            from agents.editorial_placement import (
+                EditorialPlacementEngine,
+                make_openai_embed_fn,
+            )
+            from models.image_request import ImagePurpose
+            inline_images = [
+                (req, meta)
+                for req, meta in uploaded_images
+                if req.purpose == ImagePurpose.INLINE
+            ]
+            if inline_images:
+                embed_fn = make_openai_embed_fn()
+                if embed_fn is None:
+                    logger.info("Editorial placement: OpenAI embeddings unavailable; using lexical matching.")
+                placement = EditorialPlacementEngine(embed_fn=embed_fn).place(
+                    markdown_source, inline_images
+                )
+                markdown_source = placement.markdown
+                logger.info(
+                    "Editorial layout score: %d/100 "
+                    "(distribution=%d  spacing=%d  matching=%d  rhythm=%d  cost=%.0f)",
+                    placement.score.overall,
+                    placement.score.distribution,
+                    placement.score.spacing,
+                    placement.score.section_matching,
+                    placement.score.visual_rhythm,
+                    placement.score.layout_cost,
+                )
+                for warning in placement.score.warnings:
+                    logger.warning("Editorial: %s", warning)
 
         html_content = self._to_html(markdown_source, site_url=self._service.site_url)
 
@@ -354,15 +409,57 @@ class PublisherAgent:
         """
         Create a new post, or update a specific existing post when update_post_id
         is provided. Never searches for an existing post automatically.
+
+        After every create or update the post is immediately re-fetched by ID to
+        confirm it exists in WordPress before returning. This catches phantom IDs
+        (caching proxies, rolled-back transactions, plugin hooks that delete the
+        post after creation) so the pipeline never reports ✓ on a ghost post.
         """
+        from services.wordpress_service import WordPressAPIError
+
         if update_post_id is not None:
             post = self._service.update_post(update_post_id, payload)
-            logger.info("Post updated (explicit --post-id=%d): %s", update_post_id, post["link"])
-            return post["id"], post["link"]
+            post_id  = post.get("id")
+            post_url = post.get("link", "")
+            if not isinstance(post_id, int) or post_id <= 0:
+                raise WordPressAPIError(
+                    f"WordPress update returned an invalid post ID: {post_id!r}. "
+                    f"Raw response keys: {list(post.keys())}"
+                )
+            verified = self._service.get_post(post_id)
+            if verified is None:
+                raise WordPressAPIError(
+                    f"Post ID {post_id} was not retrievable after update — "
+                    "the WordPress API accepted the request but the post does not exist."
+                )
+            logger.info("Post updated and verified (ID=%d): %s", post_id, post_url)
+            return post_id, post_url
 
         post = self._service.create_post(payload)
-        logger.info("Post created: ID=%d URL=%s", post["id"], post["link"])
-        return post["id"], post["link"]
+        post_id  = post.get("id")
+        post_url = post.get("link", "")
+
+        if not isinstance(post_id, int) or post_id <= 0:
+            raise WordPressAPIError(
+                f"WordPress create returned an invalid post ID: {post_id!r}. "
+                f"Raw response keys: {list(post.keys())}"
+            )
+        if not post_url:
+            raise WordPressAPIError(
+                f"WordPress create returned post ID {post_id} but no link/URL. "
+                f"Raw response keys: {list(post.keys())}"
+            )
+
+        verified = self._service.get_post(post_id)
+        if verified is None:
+            raise WordPressAPIError(
+                f"Post ID {post_id} was not retrievable after creation — "
+                "the WordPress API accepted the request but the post does not exist. "
+                f"Claimed URL was: {post_url}"
+            )
+
+        logger.info("Post created and verified (ID=%d): %s", post_id, post_url)
+        return post_id, post_url
 
     def _simulate_upsert(self, article: Article, update_post_id: int | None = None) -> str:
         """
@@ -437,39 +534,17 @@ class PublisherAgent:
             if not meta.url:
                 logger.warning("Skipping image injection for %s — no URL available.", req.id)
                 continue
-
-            marker = req.placement_marker
             figure = PublisherAgent._build_figure(req, meta)
-            html = html.replace(marker, figure)
+            html = html.replace(req.placement_marker, figure)
 
-        # Remove any markers that were not replaced (missing uploads)
+        # Remove any markers that were not replaced (upload failed or missing)
         html = re.sub(r'<!-- SEO_AGENT_IMAGE: [^>]+ -->', '', html)
         return html
 
     @staticmethod
     def _build_figure(req: "ImageRequest", meta: ImageMetadata) -> str:
-        img_style = PublisherAgent._S_IMG
-        attrs = (
-            f'src="{meta.url}" alt="{req.alt_text}" '
-            f'loading="lazy" decoding="async" style="{img_style}"'
-        )
-        if meta.width:
-            attrs += f' width="{meta.width}"'
-        if meta.height:
-            attrs += f' height="{meta.height}"'
-        img = f'<img {attrs} />'
-        figure_style = PublisherAgent._S_FIGURE
-        if req.caption:
-            caption_style = PublisherAgent._S_FIGCAPTION
-            return (
-                f'<figure class="wp-block-image size-full" style="{figure_style}">'
-                f'{img}'
-                f'<figcaption class="wp-element-caption" style="{caption_style}">'
-                f'{req.caption}'
-                f'</figcaption>'
-                f'</figure>'
-            )
-        return f'<figure class="wp-block-image size-full" style="{figure_style}">{img}</figure>'
+        from services.editorial_html_renderer import EditorialHTMLRenderer
+        return EditorialHTMLRenderer.render_figure(req, meta)
 
     @staticmethod
     def _extract_featured_media_id(
@@ -613,223 +688,8 @@ class PublisherAgent:
 
     @staticmethod
     def _to_html(markdown_content: str, site_url: str = "") -> str:
-        html = md_parser.markdown(markdown_content, extensions=["extra"])
-        return PublisherAgent._enrich_html(html, site_url=site_url)
-
-    # ── Typography constants ──────────────────────────────────────────────────
-    _S_H1 = (
-        "font-size:44px;font-weight:700;line-height:1.2;"
-        "margin-top:0;margin-bottom:32px;"
-    )
-    _S_H2 = (
-        "font-size:34px;font-weight:700;line-height:1.3;"
-        "margin-top:64px;margin-bottom:24px;"
-    )
-    _S_H3 = (
-        "font-size:26px;font-weight:600;line-height:1.35;"
-        "margin-top:40px;margin-bottom:16px;"
-    )
-    _S_P = (
-        "font-size:19px;line-height:1.85;margin-bottom:24px;"
-    )
-    _S_LI = (
-        "font-size:19px;line-height:1.85;margin-bottom:10px;"
-    )
-    _S_TABLE = (
-        "width:100%;border-collapse:collapse;"
-        "margin-top:32px;margin-bottom:40px;"
-        "font-size:17px;line-height:1.6;"
-    )
-    _S_TH = (
-        "padding:14px 18px;text-align:left;font-weight:700;"
-        "background:#1e293b;color:#ffffff;"
-        "border-bottom:3px solid #0f172a;"
-    )
-    _S_TD = (
-        "padding:13px 18px;"
-        "border-bottom:1px solid #e2e8f0;"
-        "vertical-align:top;"
-    )
-    _S_CALLOUT = (
-        "display:flex;align-items:flex-start;gap:14px;"
-        "border-left:4px solid #f59e0b;"
-        "padding:20px 24px;background:#fefce8;"
-        "margin:40px 0 32px;border-radius:0 8px 8px 0;"
-        "font-size:17px;line-height:1.7;"
-    )
-    _S_FIGURE = (
-        "margin:40px 0 32px;display:block;"
-    )
-    _S_IMG = (
-        "width:100%;height:auto;border-radius:8px;display:block;"
-    )
-    _S_FIGCAPTION = (
-        "font-size:15px;line-height:1.6;color:#64748b;"
-        "margin-top:10px;font-style:italic;text-align:center;"
-    )
-    _S_LINK_EXT = (
-        "color:#2563eb;text-decoration:underline;text-underline-offset:3px;"
-    )
-    _S_LINK_INT = (
-        "color:#0f172a;text-decoration:underline;text-underline-offset:3px;"
-        "font-weight:500;"
-    )
-
-    @staticmethod
-    def _enrich_html(html: str, site_url: str = "") -> str:
-        """
-        Post-process converted HTML for editorial quality and performance.
-
-        Applies the full editorial style spec via inline CSS so the output is
-        self-contained and theme-independent. WordPress (admin user, REST API)
-        preserves inline style attributes via wp_kses_post().
-
-        Transforms applied in order:
-        1. Callouts   — <blockquote> → styled editorial callout div
-        2. Tables     — add full inline table + th/td styles
-        3. Typography — h1/h2/h3/p/li inline styles
-        4. Images     — ensure loading="lazy" decoding="async" on all <img>
-        5. Links      — external links get target="_blank" rel="noopener noreferrer"
-
-        Note: figure/img/figcaption elements are built by _build_figure() and
-        injected AFTER this method runs — their styles live in _build_figure().
-        """
-        from urllib.parse import urlparse
-
-        site_host = urlparse(site_url.rstrip("/")).netloc.lstrip("www.") if site_url else ""
-
-        def _add_style(tag: str, css: str) -> str:
-            """Add css to an opening tag string; merge if style already present."""
-            if 'style="' in tag:
-                return tag.replace('style="', f'style="{css}', 1)
-            close = tag.rindex('>')
-            return tag[:close] + f' style="{css}"' + tag[close:]
-
-        # ── 1. Blockquote callouts ────────────────────────────────────────────
-        # Markdown renders  > ⚠️ **Important:** text  as:
-        #   <blockquote><p>⚠️ <strong>Important:</strong> text</p></blockquote>
-        # The emoji/icon comes from the article content; we don't add another.
-        def _callout(m: re.Match) -> str:
-            inner = m.group(1).strip()
-            return (
-                f'<div class="wp-block-callout" style="{PublisherAgent._S_CALLOUT}">'
-                f'<div style="font-size:22px;flex-shrink:0;line-height:1;">💡</div>'
-                f'<div style="flex:1;">{inner}</div>'
-                f'</div>'
-            )
-
-        html = re.sub(
-            r'<blockquote>\s*(<p>.*?</p>)\s*</blockquote>',
-            _callout,
-            html,
-            flags=re.DOTALL,
-        )
-
-        # ── 2. Tables ─────────────────────────────────────────────────────────
-        html = re.sub(
-            r'<table\b[^>]*>',
-            lambda m: _add_style(
-                '<table class="wp-block-table">', PublisherAgent._S_TABLE
-            ),
-            html,
-        )
-        html = re.sub(
-            r'<th\b[^>]*>',
-            lambda m: _add_style('<th>', PublisherAgent._S_TH),
-            html,
-        )
-        html = re.sub(
-            r'<td\b[^>]*>',
-            lambda m: _add_style('<td>', PublisherAgent._S_TD),
-            html,
-        )
-        # Odd rows: alternate background via nth-child — apply to tbody rows
-        html = re.sub(
-            r'<tr\b[^>]*>',
-            '<tr>',
-            html,
-        )
-
-        # ── 3. Typography ─────────────────────────────────────────────────────
-        # Only add style when not already present (figures/callouts already styled)
-        def _style_tag(tag_name: str, css: str, m: re.Match) -> str:
-            tag = m.group(0)
-            if 'style=' in tag:
-                return tag
-            return _add_style(tag, css)
-
-        html = re.sub(
-            r'<h1\b[^>]*>',
-            lambda m: _style_tag('h1', PublisherAgent._S_H1, m),
-            html,
-        )
-        html = re.sub(
-            r'<h2\b[^>]*>',
-            lambda m: _style_tag('h2', PublisherAgent._S_H2, m),
-            html,
-        )
-        html = re.sub(
-            r'<h3\b[^>]*>',
-            lambda m: _style_tag('h3', PublisherAgent._S_H3, m),
-            html,
-        )
-        html = re.sub(
-            r'<p\b(?![^>]*class="wp-element-caption")[^>]*>',
-            lambda m: _style_tag('p', PublisherAgent._S_P, m),
-            html,
-        )
-        html = re.sub(
-            r'<li\b[^>]*>',
-            lambda m: _style_tag('li', PublisherAgent._S_LI, m),
-            html,
-        )
-
-        # ── 4. Inline images — lazy + decoding ───────────────────────────────
-        def _add_lazy(m: re.Match) -> str:
-            tag = m.group(0)
-            if 'loading=' not in tag:
-                tag = tag[:-2] + ' loading="lazy"' + tag[-2:]
-            if 'decoding=' not in tag:
-                tag = tag[:-2] + ' decoding="async"' + tag[-2:]
-            return tag
-
-        html = re.sub(r'<img\b[^>]*/>', _add_lazy, html)
-
-        # Note: figure/img/figcaption blocks come from _build_figure(), which is
-        # called by _inject_images() AFTER _enrich_html(). Those styles are applied
-        # directly in _build_figure() via _S_FIGURE / _S_IMG / _S_FIGCAPTION.
-
-        # ── 5. Links ─────────────────────────────────────────────────────────
-        # External links: add target + rel + style
-        # Internal links: add style only
-        def _style_link(m: re.Match) -> str:
-            full_tag = m.group(0)
-            href_match = re.search(r'href="([^"]*)"', full_tag)
-            if not href_match:
-                return full_tag
-            href = href_match.group(1)
-
-            if not href or href.startswith(("#", "mailto:", "tel:")):
-                return full_tag
-
-            parsed = urlparse(href)
-            is_external = (
-                bool(parsed.scheme)
-                and parsed.scheme in ("http", "https")
-                and (not site_host or site_host not in parsed.netloc)
-            )
-
-            if is_external:
-                tag = full_tag
-                if 'target=' not in tag:
-                    tag = tag.rstrip('>') + ' target="_blank" rel="noopener noreferrer">'
-                return _add_style(tag, PublisherAgent._S_LINK_EXT) if 'style=' not in tag else tag
-            else:
-                return _add_style(full_tag, PublisherAgent._S_LINK_INT) if 'style=' not in full_tag else full_tag
-
-        html = re.sub(r'<a\b[^>]*>', _style_link, html)
-
-        return html
+        from services.editorial_html_renderer import EditorialHTMLRenderer
+        return EditorialHTMLRenderer().render(markdown_content, site_url=site_url)
 
     @staticmethod
     def analyze_html(html: str, site_url: str = "") -> dict[str, int | bool]:

@@ -13,6 +13,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from config import settings as _settings
 from models.article import Article
 from services.claude_service import ClaudeService, claude
 
@@ -66,6 +67,7 @@ class LinkEnricherAgent:
 
     def __init__(self, service: ClaudeService = claude) -> None:
         self._service = service
+        self.last_links_added: int = 0
 
     def enrich(
         self,
@@ -122,6 +124,8 @@ class LinkEnricherAgent:
                 input_schema=_ENRICH_SCHEMA,
                 max_tokens=8192,
                 thinking=False,
+                model=_settings.link_enricher_model,
+                label="enrich:links",
             )
             enriched = data.get("enriched_markdown", "").strip()
             links = data.get("links_added", [])
@@ -130,9 +134,10 @@ class LinkEnricherAgent:
                 logger.warning("LinkEnricher: Claude returned empty markdown — using original.")
                 return markdown
 
+            self.last_links_added = len(links)
             logger.info(
                 "LinkEnricher: %d internal link(s) added — %s",
-                len(links),
+                self.last_links_added,
                 "; ".join(links[:4]),
             )
             return enriched

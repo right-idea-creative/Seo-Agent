@@ -4,6 +4,7 @@ from uuid import UUID, uuid4
 
 from pydantic import BaseModel, Field, model_validator
 
+from models.article_plan import PlannedImage
 from models.enums import ArticleLanguage, ArticleStatus, ArticleTone
 from models.location import Location
 from models.media import ImageMetadata
@@ -48,10 +49,10 @@ class ArticleRequest(BaseModel):
         description="Language of the generated article."
     )
     word_count: int = Field(
-        default=1000,
+        default=850,
         ge=300,
         le=10000,
-        description="Target word count for the article body."
+        description="Target word count for the article body. Production target: 850 words (700–1000).",
     )
     tone: ArticleTone = Field(
         default=ArticleTone.PROFESIONAL,
@@ -60,6 +61,17 @@ class ArticleRequest(BaseModel):
     target_audience: str | None = Field(
         default=None,
         description="Who this article is written for, e.g. 'homeowners in Denver'."
+    )
+
+    # ── Website context ───────────────────────────────────────
+
+    website_url: str | None = Field(
+        default=None,
+        description=(
+            "WordPress site URL loaded from credentials, e.g. 'https://ohdeugene.com'. "
+            "Used by the planner to infer city and service when they are not explicitly provided. "
+            "Not published or stored in the article output."
+        ),
     )
 
     # ── SEO hints ─────────────────────────────────────────────
@@ -220,6 +232,18 @@ class Article(BaseModel):
     featured_image: ImageMetadata | None = None
     images: list[ImageMetadata] = Field(default_factory=list)
 
+    # ── Image plan (from ArticlePlannerService) ───────────────
+
+    image_plans: list[PlannedImage] = Field(
+        default_factory=list,
+        description=(
+            "Image intent plan produced by the article planner. "
+            "ImageResolverAgent uses this to skip its own Claude planning call "
+            "and resolve images directly from the planner's intent. "
+            "Empty when planning was skipped."
+        ),
+    )
+
     # ── Publishing ────────────────────────────────────────────
 
     publishing: PublishingOptions = Field(default_factory=PublishingOptions)
@@ -255,6 +279,16 @@ class Article(BaseModel):
     model_name: str = Field(
         default="",
         description="Claude model used for generation, e.g. 'claude-opus-4-8'."
+    )
+    topic_id: str | None = Field(
+        default=None,
+        description=(
+            "Stable, location-agnostic topic identifier in kebab-case. "
+            "Derived from the article topic with location words stripped. "
+            "Example: 'garage-door-spring-repair'. "
+            "Used by DraftReuseService for deterministic topic matching before "
+            "falling back to Jaccard similarity scoring."
+        ),
     )
 
     # ── Properties ────────────────────────────────────────────

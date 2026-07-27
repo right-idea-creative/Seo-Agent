@@ -103,3 +103,25 @@ class CredentialStore:
 
         logger.debug("Loaded credentials for %s/%s from %s", client_id, website_id, path)
         return creds
+
+    def exists(self, client_id: str, website_id: str) -> bool:
+        """Return True if a credential file already exists for the given tenant."""
+        return (self._dir / client_id / f"{website_id}.json").exists()
+
+    def save(self, client_id: str, website_id: str, credentials: WordPressCredentials) -> Path:
+        """
+        Persist credentials for the given tenant.
+
+        Args:
+            client_id:   Client identifier matching TenantContext.client_id.
+            website_id:  Website identifier matching TenantContext.website_id.
+            credentials: Validated WordPressCredentials to write.
+
+        Returns:
+            Path to the written credential file.
+        """
+        path = self._dir / client_id / f"{website_id}.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(credentials.model_dump_json(indent=2), encoding="utf-8")
+        logger.debug("Saved credentials for %s/%s to %s", client_id, website_id, path)
+        return path

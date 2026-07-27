@@ -37,4 +37,11 @@ __pycache__/
 # Logs
 *.log
 budget/
+# Temporary images
+original.jpg
+edited.jpg
+validate-image.png
+ChippewaTeamPhoto.jpg
 
+# Backup files
+*.save

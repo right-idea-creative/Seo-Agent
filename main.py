@@ -1,3 +1,4 @@
+import csv
 import logging
 import re
 import time
@@ -13,19 +14,26 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
-from agents import DryRunReport, ImageResolverAgent, ImageResolverError, PublisherAgent, article_agent, link_enricher
-from agents.publisher_agent import SEOQualityError, PublisherAgent as _PA
+from agents import ArticleValidationError, DryRunReport, DualQAAgent, DualQAFailedError, ImageResolverAgent, ImageResolverError, PublisherAgent, SEOQualityError, article_agent, link_enricher
+from services.budget_service import BudgetExceededError
+from services.draft_reuse_service import DraftMatch, DraftReuseService
+from services.business_context_resolver import BusinessContextResolver
 from config import settings
 from models import ArticleRequest, Location, TenantContext
+from models.site_profile import SiteProfile
 from models.article import Article, SEOMetadata
 from services.seo_qa_service import SEOQAService
 from models.enums import ArticleLanguage, ArticleTone, PublishStatus, SEOPlugin
-from services import ClaudeAPIError, ClaudeRateLimitError, MediaService, WordPressService
-from services import budget, GoogleDriveService, OpenAIImageGenerator, VisualStyleService
+from services import ClaudeAPIError, ClaudeRateLimitError, LLMAllProvidersFailedError, MediaService, SiteProfileService, WordPressService
+from services import budget, GoogleDriveService, OpenAIImageGenerator, OpenAIReviewService
+from services import EditorialHistoryService
 from services import DriveImageIndex
 from services import claude
-from services.credential_store import CredentialError, CredentialNotFoundError, CredentialStore
-from services.wordpress_service import WordPressAuthError, WordPressError
+from services import ContentSanitizationService, SanitizationResult
+from services import PublicationReadinessService, ReadinessResult
+from services import PublicationCertificationService, CertificationReport
+from services.credential_store import CredentialError, CredentialNotFoundError, CredentialStore, WordPressCredentials
+from services.wordpress_service import SiteValidationResult, WordPressAuthError, WordPressError
 from models.seo_report import IssueSeverity, SEOReport
 
 @dataclass
@@ -46,12 +54,17 @@ class _PipelineState:
     images_active: bool = False       # whether image resolution ran at all
     images_skip_reason: str = ""
     drive_indexed: int = 0
+    drive_semantic_candidates: int = 0   # Drive photos with keyword overlap > 0 (before Vision)
     img_requested: int = 0
-    img_from_drive: int = 0
-    img_from_openai: int = 0
+    img_from_drive: int = 0         # P1: original Drive photos published as-is
+    img_from_edited: int = 0        # P2: original Drive photos with minimal preservation edit
     img_uploaded: int = 0
     img_featured: bool = False
     img_errors: list[str] = _dc_field(default_factory=list)
+    ai_reasons: list[str] = _dc_field(default_factory=list)  # edit reasons for EDITED images
+    openai_budget_total: int = 0
+    openai_budget_remaining: int = 0
+    edited_photos: list = _dc_field(default_factory=list)    # per-edit audit details
 
     # Stage 4: HTML
     html_tables: int = 0
@@ -60,7 +73,39 @@ class _PipelineState:
     html_internal_links: int = 0
     html_external_links: int = 0
 
-    # Stage 4b: SEO QA
+    # Stage 4: Dual QA
+    dual_qa_enabled: bool = False
+    dual_qa_passed: bool = False
+    dual_qa_iterations: int = 0
+    dual_qa_seo_score: int = 0
+    dual_qa_editorial_score: int = 0
+    dual_qa_writing_score: int = 0
+    dual_qa_authenticity_score: int = 0
+    dual_qa_combined_score: float = 0.0
+    dual_qa_images_reviewed: int = 0
+    dual_qa_images_passed: int = 0
+    dual_qa_images_failed: int = 0
+    dual_qa_rejection_reasons: list[str] = _dc_field(default_factory=list)
+    dual_qa_image_results: list = _dc_field(default_factory=list)
+    # Publication readiness + authenticity
+    dual_qa_publication_readiness: float = 0.0
+    dual_qa_article_authenticity: float = 0.0
+    dual_qa_image_authenticity: float | None = None
+    dual_qa_overall_authenticity: float = 0.0
+    dual_qa_authenticity_label: str = ""
+    dual_qa_authenticity_narrative: str = ""
+    # QA cost breakdown (USD)
+    dual_qa_claude_review_cost: float = 0.0
+    dual_qa_openai_review_cost: float = 0.0
+    dual_qa_revision_cost: float = 0.0
+    dual_qa_vision_claude_cost: float = 0.0
+    dual_qa_vision_openai_cost: float = 0.0
+    dual_qa_total_cost: float = 0.0
+    # QA timing
+    dual_qa_elapsed_seconds: float = 0.0
+    dual_qa_avg_cycle_seconds: float = 0.0
+
+    # Stage 4b: SEO QA (rule-based structural check — backstop)
     qa_score: int = 0
 
     # Stage 5: Publish result
@@ -91,6 +136,8 @@ app = typer.Typer(
 console = Console()
 logger = logging.getLogger(__name__)
 
+_LAST_ARTICLE_PATH = Path("output/last_article.json")
+
 
 @app.command()
 def generate(
@@ -98,7 +145,7 @@ def generate(
     service: str | None = typer.Option(None, "--service", "-s", help="Service or product the article supports."),
     city: str | None = typer.Option(None, "--city", help="Target city for local SEO."),
     state: str | None = typer.Option(None, "--state", help="Target state or province (required with --city)."),
-    words: int = typer.Option(settings.default_word_count, "--words", "-w", min=300, max=10000, help="Target word count."),
+    words: int = typer.Option(settings.default_word_count, "--words", "-w", min=300, max=1000, help="Target word count (700–1000; default 850)."),
     tone: ArticleTone = typer.Option(settings.default_tone, "--tone", help="Writing tone."),
     language: ArticleLanguage = typer.Option(ArticleLanguage.EN, "--language", "-l", help="Article language (default: English)."),
     keyword: str | None = typer.Option(None, "--keyword", "-k", help="Primary keyword hint for the agent."),
@@ -122,14 +169,21 @@ def generate(
 
     tenant = TenantContext(client_id=resolved_client, website_id=resolved_website)
 
-    # ── Validate and build location ─────────────────────────────
+    # ── Validate CLI flags ──────────────────────────────────────
     if bool(city) != bool(state):
         console.print("[red]Error:[/red] --city and --state must be provided together.")
         raise typer.Exit(code=1)
 
-    location = Location(city=city, state=state) if city and state else None
+    # ── Load credential URL (for URL-domain extraction in resolver) ─
+    website_url: str | None = None
+    try:
+        _creds = CredentialStore(settings.credentials_dir).load(resolved_client, resolved_website)
+        website_url = _creds.url
+    except Exception:
+        pass
 
-    # ── Build request ───────────────────────────────────────────
+    # ── Build initial request ───────────────────────────────────
+    location = Location(city=city, state=state) if city and state else None
     request = ArticleRequest(
         topic=topic,
         service=service,
@@ -138,7 +192,23 @@ def generate(
         tone=tone,
         language=language,
         focus_keyword=keyword,
+        website_url=website_url,
     )
+
+    # ── Resolve business context before planning ────────────────
+    # Tries: CLI flags → SiteProfile → WP API → homepage HTML → domain heuristic.
+    # If location cannot be resolved, generation continues as a non-local article.
+    request = BusinessContextResolver(settings.profiles_dir).resolve(
+        resolved_client, resolved_website, request
+    )
+    if not request.location:
+        console.print(
+            "[yellow]Warning:[/yellow] Location could not be resolved — "
+            "generating without geographic targeting.\n"
+            "  Pass [bold]--city[/bold] / [bold]--state[/bold], or run "
+            f"[bold]seo profile create --client {resolved_client} "
+            f"--website {resolved_website}[/bold] to persist site context."
+        )
 
     _execute_generation(request, tenant, output or settings.output_dir)
 
@@ -159,22 +229,53 @@ def interactive() -> None:
     website_id = settings.default_website_id or typer.prompt("Website ID")
     tenant = TenantContext(client_id=client_id, website_id=website_id)
 
+    # ── Load credential URL (for URL-domain extraction in resolver) ─
+    website_url: str | None = None
+    try:
+        _creds = CredentialStore(settings.credentials_dir).load(client_id, website_id)
+        website_url = _creds.url
+    except Exception:
+        pass
+
+    # ── Peek at SiteProfile for wizard defaults ─────────────────
+    profile = SiteProfileService(settings.profiles_dir).load(client_id, website_id)
+    profile_city: str | None = profile.city if profile else None
+    profile_state: str | None = profile.state if profile else None
+    profile_service: str | None = profile.primary_service if profile else None
+
+    if profile:
+        console.print(
+            f"[dim]Site profile:[/dim] {profile.business_name} — "
+            f"{profile.primary_service}, {profile.city}, {profile.state}"
+        )
+    elif website_url:
+        console.print(f"[dim]Credential URL:[/dim] {website_url}")
+
     # ── Topic ──────────────────────────────────────────────────
     topic = typer.prompt("Article topic")
 
     # ── Service ────────────────────────────────────────────────
-    svc_raw = typer.prompt("Service  [optional, Enter to skip]", default="")
+    svc_raw = typer.prompt(
+        f"Service  [Enter to use: '{profile_service}']" if profile_service else "Service  [optional, Enter to skip]",
+        default=profile_service or "",
+    )
     service: str | None = svc_raw.strip() or None
 
     # ── Location ───────────────────────────────────────────────
-    city_raw = typer.prompt("City     [optional, Enter to skip]", default="")
+    city_raw = typer.prompt(
+        f"City     [Enter to use: '{profile_city}']" if profile_city else "City     [optional — resolver will try URL]",
+        default=profile_city or "",
+    )
     city: str | None = city_raw.strip() or None
     state: str | None = None
     if city:
-        state_raw = typer.prompt(f"State / Province for {city}")
+        state_raw = typer.prompt(
+            f"State    [Enter to use: '{profile_state}']" if profile_state else f"State / Province for {city}",
+            default=profile_state or "",
+        )
         state = state_raw.strip() or None
         if not state:
-            city = None  # location requires both city and state
+            city = None
 
     # ── Keyword ────────────────────────────────────────────────
     kw_raw = typer.prompt("Focus keyword  [optional, Enter to skip]", default="")
@@ -198,7 +299,25 @@ def interactive() -> None:
         tone=settings.default_tone,
         language=ArticleLanguage.EN,
         focus_keyword=keyword,
+        website_url=website_url,
     )
+
+    # ── Resolve business context before planning ────────────────
+    request = BusinessContextResolver(settings.profiles_dir).resolve(
+        client_id, website_id, request
+    )
+    if request.location:
+        console.print(
+            f"[dim]Resolved:[/dim] {request.service or '(service unknown)'} — "
+            f"{request.location.city}, {request.location.state}"
+        )
+    else:
+        console.print(
+            "[yellow]Warning:[/yellow] Location could not be resolved — "
+            "generating without geographic targeting.\n"
+            "  Create a site profile to persist context: "
+            f"[bold]seo profile create --client {client_id} --website {website_id}[/bold]"
+        )
 
     _execute_generation(request, tenant, settings.output_dir)
 
@@ -231,6 +350,16 @@ def _save_checkpoint(content: str, checkpoint_dir: Path, topic: str) -> None:
         logger.debug("Content checkpoint saved: %s", checkpoint_file)
     except OSError:
         logger.warning("Could not save content checkpoint to %s", checkpoint_dir)
+
+
+def _save_last_article(article: "Article") -> None:
+    """Persist article to output/last_article.json for the republish command."""
+    try:
+        _LAST_ARTICLE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _LAST_ARTICLE_PATH.write_text(article.model_dump_json(indent=2), encoding="utf-8")
+        logger.debug("Last article saved: %s", _LAST_ARTICLE_PATH)
+    except OSError as exc:
+        logger.warning("Could not save last article to %s: %s", _LAST_ARTICLE_PATH, exc)
 
 
 def _safe_filename(text: str) -> str:
@@ -267,35 +396,215 @@ def _execute_generation(
     base_dir: Path,
 ) -> Path:
     """
-    Run Claude generation, save to disk, and display results.
+    Generate an article (or reuse an existing draft), save to disk, and display results.
 
-    Shared by the `generate` and `interactive` commands so the generation
-    logic is never duplicated. Returns the path to the saved article.json.
+    Shared by the `generate`, `interactive`, and `autopublish` commands.
+    Returns the path to the saved article.json.
+
+    Execution order (budget-aware):
+      1. Draft Pool lookup  — free, no API calls, runs regardless of budget state.
+      2a. Reuse path        — adapts the matched draft; minor LLM calls (SEO regen,
+                              location rewrite) fall back gracefully if budget is tight.
+      2b. Budget check      — runs ONLY when no reusable draft exists.
+      3.  Fresh generation  — full article generation, blocked if budget exceeded.
+
+    This order guarantees that an exhausted monthly budget never prevents reuse of
+    an existing draft.
     """
+    from services.draft_pool_service import DraftPoolService
+    from services.location_adaptation_service import LocationAdaptationService
+    from services.reuse_stats_service import ReuseStatsService
+    from services.seo_cache_service import SEOCacheService
+    from services.topic_normalization import normalize_topic_id
+
+    budget_before = budget.status()
     checkpoint_dir = base_dir / tenant.client_id / tenant.website_id / ".checkpoints"
     start = time.perf_counter()
+    reused = False
+    location_adapted = False
+    seo_from_cache = False
+    reuse_match: DraftMatch | None = None
+    article = None
 
-    with console.status("[bold green]Generating content...", spinner="dots") as status:
+    stats = ReuseStatsService(base_dir)
 
-        def on_content_ready(content: str) -> None:
-            status.update("[bold green]Generating SEO metadata...")
-            _save_checkpoint(content, checkpoint_dir, request.topic)
-
+    # ── STEP 1: Draft Pool lookup — runs before any budget check ─────────────
+    # All operations here are free (no API calls):
+    #   pool index load, topic_id normalization, Jaccard scoring, article.json read.
+    if settings.enable_draft_reuse:
         try:
-            article = article_agent.generate(
-                request=request,
-                tenant=tenant,
-                on_content_ready=on_content_ready,
+            _profile = SiteProfileService(settings.profiles_dir).load(
+                tenant.client_id, tenant.website_id
             )
-        except ClaudeRateLimitError:
+            _req_reuse_group = _profile.reuse_group if _profile else None
+
+            # Pass 1: fast in-memory pool lookup (no filesystem scan)
+            pool = DraftPoolService(base_dir)
+            pool.build_or_load()
+
+            pool_match = pool.find_match(request, tenant, _req_reuse_group)
+            if pool_match:
+                _full = pool.load_article(pool_match, base_dir)
+                if _full:
+                    reuse_match = DraftMatch(
+                        article=_full,
+                        source_path=base_dir / pool_match.entry.article_path,
+                        similarity=pool_match.similarity,
+                        same_website=pool_match.same_website,
+                        matched_by_topic_id=pool_match.matched_by_topic_id,
+                    )
+
+            # Pass 2: fallback filesystem scan if pool had no match
+            if reuse_match is None:
+                reuse_svc = DraftReuseService(base_dir)
+                reuse_match = reuse_svc.find_match(request, tenant, req_reuse_group=_req_reuse_group)
+
+        except Exception as exc:
+            logger.warning("Draft reuse search failed (non-blocking): %s", exc)
+            reuse_match = None
+
+        if reuse_match is not None:
+            reused = True
+
+            # ── Adapt tenant/request (free, no API) ───────────────────────
+            from models.enums import ArticleStatus
+            from models.publishing import PublishingOptions
+            article = reuse_match.article.model_copy(update={
+                "tenant": tenant,
+                "request": request,
+                "publishing": PublishingOptions(),
+                "status": PublishStatus.DRAFT,
+            })
+
+            match_label = (
+                "topic_id" if reuse_match.matched_by_topic_id
+                else f"{reuse_match.similarity:.0%} similarity"
+            )
             console.print(
-                "\n[red]Error:[/red] Rate limit exceeded after retries. "
-                f"Content checkpoint saved to [dim]{checkpoint_dir}[/dim] if generation had started."
+                f"  [dim]Draft reuse:[/dim] [green]Matched[/green] "
+                f"[bold]{reuse_match.article.title[:70]}[/bold]  "
+                f"({match_label})  "
+                f"[dim]{reuse_match.source_path}[/dim]"
+            )
+
+            # ── Location adaptation (free direct replacement; targeted LLM
+            #    only for residual refs — falls back gracefully if budget tight)
+            original_location = (
+                reuse_match.article.request.location
+                if reuse_match.article.request else None
+            )
+            target_location = request.location
+            locations_differ = (
+                original_location is not None
+                and target_location is not None
+                and original_location.city.lower() != target_location.city.lower()
+            )
+
+            if locations_differ:
+                try:
+                    loc_svc = LocationAdaptationService(claude)
+                    article, loc_report = loc_svc.adapt(article, original_location, target_location)
+                    location_adapted = True
+                    _display_location_scan(loc_report)
+                    stats.record_location_adapted()
+                    if loc_report.sections_llm_budget_skipped:
+                        stats.record_location_refinement_skipped(loc_report.sections_llm_budget_skipped)
+                except Exception as exc:
+                    logger.warning("Location adaptation failed (non-blocking): %s", exc)
+                    console.print(
+                        f"  [yellow]Warning:[/yellow] Location adaptation failed — body may contain "
+                        f"references to {original_location.city}."
+                    )
+
+            # ── SEO cache check (free) / regeneration (minor LLM call) ───
+            # Budget-aware: if the monthly limit is exceeded, skip SEO regen and
+            # reuse the original metadata — never block the entire reuse path.
+            req_topic_id = normalize_topic_id(request.topic, request.location)
+            seo_cache = SEOCacheService(base_dir, tenant.client_id, tenant.website_id)
+            cached_seo = seo_cache.get(req_topic_id, request.focus_keyword)
+
+            if cached_seo is not None:
+                article = article.model_copy(update={"seo": cached_seo})
+                seo_from_cache = True
+                stats.record_seo_cache_hit()
+                console.print("  [dim]SEO metadata loaded from cache (no API call).[/dim]")
+            else:
+                _seo_budget_ok = True
+                try:
+                    budget.check_monthly_total(settings.max_monthly_cost_usd)
+                except BudgetExceededError:
+                    _seo_budget_ok = False
+                    logger.warning(
+                        "SEO regeneration skipped (monthly budget exceeded). "
+                        "Reusing existing SEO."
+                    )
+                    console.print(
+                        "  [dim]SEO regeneration skipped (monthly budget exceeded). "
+                        "Reusing existing SEO.[/dim]"
+                    )
+                    stats.record_seo_regen_skipped()
+
+                if _seo_budget_ok:
+                    try:
+                        with console.status(
+                            "[bold green]Regenerating SEO metadata for this website...",
+                            spinner="dots",
+                        ):
+                            new_seo = article_agent._generate_seo(request, article.content_markdown)
+                        article = article.model_copy(update={"seo": new_seo})
+                        seo_cache.put(req_topic_id, new_seo, request.focus_keyword)
+                        console.print("  [dim]SEO metadata regenerated and cached.[/dim]")
+                    except Exception as exc:
+                        logger.warning("SEO regeneration after reuse failed (non-blocking): %s", exc)
+                        console.print(
+                            "  [yellow]Warning:[/yellow] SEO regeneration failed — "
+                            "reusing original SEO metadata."
+                        )
+
+    # ── STEP 2: Budget check — only reached when no draft was found ───────────
+    if not reused:
+        try:
+            budget.check_monthly_total(settings.max_monthly_cost_usd)
+        except BudgetExceededError as exc:
+            stats.record_budget_block_generation()
+            try:
+                stats.save()
+            except Exception:
+                pass
+            console.print(
+                f"\n[red]No reusable draft found and monthly generation budget has been exceeded.[/red]\n"
+                f"[dim]{exc}[/dim]"
             )
             raise typer.Exit(code=1)
-        except ClaudeAPIError as exc:
-            console.print(f"\n[red]Error:[/red] {exc}")
-            raise typer.Exit(code=1)
+
+    # ── STEP 3: Fresh generation (only when no reusable draft exists) ─────────
+    if not reused:
+        with console.status("[bold green]Generating content...", spinner="dots") as status:
+
+            def on_content_ready(content: str) -> None:
+                status.update("[bold green]Generating SEO metadata...")
+                _save_checkpoint(content, checkpoint_dir, request.topic)
+
+            try:
+                article = article_agent.generate(
+                    request=request,
+                    tenant=tenant,
+                    on_content_ready=on_content_ready,
+                )
+            except ArticleValidationError as exc:
+                console.print(f"\n[red]Validation error:[/red] {exc}")
+                raise typer.Exit(code=1)
+            except LLMAllProvidersFailedError:
+                raise typer.Exit(code=1)
+            except ClaudeRateLimitError:
+                console.print(
+                    "\n[red]Error:[/red] Rate limit exceeded after retries. "
+                    f"Content checkpoint saved to [dim]{checkpoint_dir}[/dim] if generation had started."
+                )
+                raise typer.Exit(code=1)
+            except ClaudeAPIError as exc:
+                console.print(f"\n[red]Error:[/red] {exc}")
+                raise typer.Exit(code=1)
 
     elapsed = time.perf_counter() - start
 
@@ -309,7 +618,53 @@ def _execute_generation(
         )
         raise typer.Exit(code=1)
 
+    # ── Update draft pool with newly saved article ────────────────────────────
+    try:
+        pool = DraftPoolService(base_dir)
+        pool.build_or_load()
+        pool.add_entry(article, article_dir / "article.json")
+        pool.save()
+    except Exception as exc:
+        logger.warning("Draft pool update failed (non-blocking): %s", exc)
+
     _display_result(article, article_dir, elapsed)
+
+    # ── Cost report ───────────────────────────────────────────────────────────
+    budget_after = budget.status()
+    article_cost = round(
+        (budget_after["claude"]["usd"] - budget_before["claude"]["usd"])
+        + (budget_after["openai"]["usd"] - budget_before["openai"]["usd"]),
+        6,
+    )
+    _display_cost_report(
+        claude_cost=round(budget_after["claude"]["usd"] - budget_before["claude"]["usd"], 6),
+        openai_cost=round(budget_after["openai"]["usd"] - budget_before["openai"]["usd"], 6),
+        article_cost=article_cost,
+        monthly_total=budget_after["claude"]["usd"] + budget_after["openai"]["usd"],
+        monthly_limit=settings.max_monthly_cost_usd,
+        article_limit=settings.max_article_cost_usd,
+        reused=reused,
+        reuse_match=reuse_match,
+    )
+
+    # ── Reuse stats: record + display ─────────────────────────────────────────
+    req_topic_id_for_stats = normalize_topic_id(request.topic, request.location)
+    if reused:
+        api_calls_avoided = 1  # article generation skipped
+        if seo_from_cache:
+            api_calls_avoided += 1  # SEO regen also skipped
+        stats.record_reuse(req_topic_id_for_stats, savings_usd=settings.max_article_cost_usd)
+        stats.record_api_calls_avoided(api_calls_avoided)
+    else:
+        stats.record_generation(cost_usd=article_cost)
+
+    try:
+        stats.save()
+    except Exception as exc:
+        logger.warning("Stats save failed (non-blocking): %s", exc)
+
+    _display_reuse_stats(stats.monthly_report())
+
     return article_dir / "article.json"
 
 
@@ -323,6 +678,7 @@ def _run_publish_flow(
     min_score: int | None = None,
     no_image: bool = False,
     no_links: bool = False,
+    no_qa: bool = False,
     post_id: int | None = None,
     show_pipeline_report: bool = True,
 ) -> tuple[Article, _PipelineState]:
@@ -336,6 +692,14 @@ def _run_publish_flow(
     """
     effective_min_score = min_score if min_score is not None else settings.seo_qa_min_score
     t_total_start = time.perf_counter()
+
+    # ── Monthly budget guard ──────────────────────────────────────────────────
+    try:
+        budget.check_monthly_total(settings.max_monthly_cost_usd)
+    except BudgetExceededError as exc:
+        console.print(f"\n[red]Monthly budget exceeded:[/red] {exc}")
+        raise typer.Exit(code=1)
+
     budget_before = budget.status()
 
     # Load credentials from the article's tenant context
@@ -350,16 +714,55 @@ def _run_publish_flow(
         console.print(f"[red]Error:[/red] Invalid credential file: {exc}")
         raise typer.Exit(code=1)
 
+    # Content sanitization — remove UI artifacts before any pipeline stage sees the content
+    san_result = ContentSanitizationService().sanitize(article.content_markdown)
+    if san_result.changed:
+        article = article.model_copy(update={"content_markdown": san_result.markdown})
+        _display_sanitization(san_result)
+
     # Image resolution (before WP connection — no WP calls needed)
     image_plan = None
     resolved_images: list = []
     drive_count = 0
     resolve_elapsed = 0.0
+    img_stats: dict = {}
 
+    editorial_history = EditorialHistoryService(
+        settings.editorial_history_path.parent
+        / article.tenant.client_id
+        / article.tenant.website_id
+        / "image_usage.json"
+    )
     if not no_image:
         resolve_start = time.perf_counter()
-        image_plan, resolved_images, drive_count = _resolve_images(article)
+        image_plan, resolved_images, drive_count, img_stats = _resolve_images(
+            article, editorial_history=editorial_history
+        )
         resolve_elapsed = time.perf_counter() - resolve_start
+
+    # Merge image markers into the canonical markdown before QA and publishing.
+    # From this point on article.content_markdown is the single source of truth:
+    # QA sees and preserves the markers; the publisher reads them from there directly.
+    if image_plan is not None:
+        article = article.model_copy(update={
+            "content_markdown": image_plan.modified_markdown
+        })
+        try:
+            article_path.write_text(article.model_dump_json(indent=2), encoding="utf-8")
+            (article_path.parent / "article.md").write_text(
+                article.content_markdown, encoding="utf-8"
+            )
+        except OSError as exc:
+            logger.warning("Could not persist marker-bearing markdown to disk: %s", exc)
+
+    # Dual QA (before WordPress — no wasted API calls if article fails review).
+    # DualQAAgent.run() also guarantees full marker integrity when image_plan is supplied.
+    qa_report = None
+    if settings.qa_enabled and not no_qa:
+        article, resolved_images, qa_report = _run_dual_qa(
+            article, resolved_images, article_path,
+            image_plan=image_plan,
+        )
 
     with WordPressService(creds) as wp:
         agent = PublisherAgent(wp)
@@ -413,13 +816,58 @@ def _run_publish_flow(
         elif image_plan is None:
             state.images_skip_reason = "Drive and OpenAI not configured (or setup failed)"
         else:
-            state.images_active    = True
-            state.drive_indexed    = drive_count
-            state.img_requested    = len(image_plan.requests)
-            state.img_from_drive   = sum(1 for _, a in resolved_images if a.source == ImageSource.DRIVE)
-            state.img_from_openai  = sum(1 for _, a in resolved_images if a.source == ImageSource.GENERATED)
+            state.images_active              = True
+            state.drive_indexed              = drive_count
+            state.drive_semantic_candidates  = img_stats.get("drive_semantic_candidates", 0)
+            state.img_requested              = len(image_plan.requests)
+            state.img_from_drive             = sum(1 for _, a in resolved_images if a.source == ImageSource.DRIVE)
+            state.img_from_edited            = sum(1 for _, a in resolved_images if a.source == ImageSource.EDITED)
+            state.ai_reasons                 = [
+                a.ai_reason for _, a in resolved_images
+                if a.ai_reason and a.source == ImageSource.EDITED
+            ]
+            state.openai_budget_total     = img_stats.get("edit_budget_total", 0)
+            state.openai_budget_remaining = img_stats.get("edit_budget_remaining", 0)
+            state.edited_photos           = img_stats.get("edited_photos", [])
 
         state.t_images = resolve_elapsed
+
+        # ── Stage 4: Dual QA state ───────────────────────────────
+        if qa_report is not None:
+            from models.qa_report import DualQAReport as _DualQAReport
+            state.dual_qa_enabled = True
+            state.dual_qa_passed = qa_report.article_review_passed
+            state.dual_qa_iterations = qa_report.iterations_used
+            if qa_report.final_article_review is not None:
+                r = qa_report.final_article_review
+                state.dual_qa_seo_score       = r.seo_score
+                state.dual_qa_editorial_score = r.editorial_score
+                state.dual_qa_writing_score   = r.writing_score
+                state.dual_qa_authenticity_score = r.authenticity_score
+                state.dual_qa_combined_score  = round(r.combined_score, 1)
+            reviewed_images = qa_report.image_results
+            state.dual_qa_images_reviewed = len(reviewed_images)
+            state.dual_qa_images_passed   = sum(1 for r in reviewed_images if r.approved)
+            state.dual_qa_images_failed   = sum(1 for r in reviewed_images if not r.approved)
+            state.dual_qa_rejection_reasons = qa_report.rejection_reasons
+            state.dual_qa_image_results = qa_report.image_results
+            # Publication readiness + authenticity
+            state.dual_qa_publication_readiness = qa_report.publication_readiness_score
+            state.dual_qa_article_authenticity  = qa_report.article_authenticity
+            state.dual_qa_image_authenticity    = qa_report.image_authenticity
+            state.dual_qa_overall_authenticity  = qa_report.overall_authenticity
+            state.dual_qa_authenticity_label    = qa_report.authenticity_label
+            state.dual_qa_authenticity_narrative = qa_report.authenticity_narrative
+            # QA cost breakdown
+            state.dual_qa_claude_review_cost  = qa_report.claude_review_cost_usd
+            state.dual_qa_openai_review_cost  = qa_report.openai_review_cost_usd
+            state.dual_qa_revision_cost       = qa_report.revision_cost_usd
+            state.dual_qa_vision_claude_cost  = qa_report.vision_claude_cost_usd
+            state.dual_qa_vision_openai_cost  = qa_report.vision_openai_cost_usd
+            state.dual_qa_total_cost          = qa_report.total_qa_cost_usd
+            # QA timing
+            state.dual_qa_elapsed_seconds     = qa_report.qa_elapsed_seconds
+            state.dual_qa_avg_cycle_seconds   = qa_report.avg_cycle_seconds
 
         # ── Upload resolved images to WP Media Library ───────────
         uploaded_images = None
@@ -447,20 +895,64 @@ def _run_publish_flow(
                 for req, meta in uploaded_images
             )
 
-        # ── Stage 4b: SEO QA score (captured before publish raises on failure) ─
-        state.qa_score = SEOQAService().analyze(article).score
+        # ── Link enrichment (upstream of readiness gate) ─────────
+        links_added = 0
+        if not no_links:
+            try:
+                posts = wp.list_posts()
+                enriched_md = link_enricher.enrich(article, posts, article.content_markdown)
+                links_added = link_enricher.last_links_added
+                article = article.model_copy(update={"content_markdown": enriched_md})
+            except Exception as exc:
+                logger.warning("Link enrichment failed (non-blocking): %s", exc)
+
+        # ── SEO QA for readiness gate ────────────────────────────
+        gate_seo_report = None
+        try:
+            gate_seo_report = SEOQAService().analyze(article)
+        except Exception as exc:
+            logger.warning("Pre-gate SEO QA failed: %s", exc)
+
+        # ── Publication readiness gate ───────────────────────────
+        dual_qa_passed_bool: bool | None = None
+        if state.dual_qa_enabled:
+            dual_qa_passed_bool = state.dual_qa_passed
+        readiness = PublicationReadinessService().validate(
+            article=article,
+            image_plan=image_plan,
+            resolved_images=resolved_images,
+            uploaded_images=uploaded_images,
+            links_added=links_added,
+            no_links=no_links,
+            seo_qa_report=gate_seo_report,
+            min_seo_score=effective_min_score,
+            dual_qa_passed=dual_qa_passed_bool,
+            min_word_count=settings.min_article_words,
+        )
+        _display_readiness_gate(readiness)
+        if not readiness.ready:
+            warn_suffix = (
+                f"  ({len(readiness.warnings)} warning(s) noted but non-blocking.)"
+                if readiness.warnings else ""
+            )
+            console.print(
+                "\n[red]Publication blocked:[/red] "
+                f"{len(readiness.failures)} readiness check(s) failed. "
+                f"No WordPress post was created.{warn_suffix}"
+            )
+            raise typer.Exit(code=1)
 
         # ── Publish ──────────────────────────────────────────────
+        # link_enricher=None because enrichment already ran upstream
         t_publish_start = time.perf_counter()
         try:
             with console.status("[bold green]Publishing to WordPress...", spinner="dots"):
                 updated = agent.publish(
                     article,
                     min_score=effective_min_score,
-                    image_plan=image_plan,
                     uploaded_images=uploaded_images or None,
                     update_post_id=post_id,
-                    link_enricher=None if no_links else link_enricher,
+                    link_enricher=None,
                 )
         except SEOQualityError as exc:
             _display_qa_report(exc.report, exc.min_score)
@@ -472,11 +964,33 @@ def _run_publish_flow(
             console.print(f"\n[red]WordPress error:[/red] {exc}")
             raise typer.Exit(code=1)
 
+        # ── Stage 4b: SEO QA score ───────────────────────────────
+        state.qa_score = agent.last_qa_report.score if agent.last_qa_report else (gate_seo_report.score if gate_seo_report else 0)
+
         state.t_publish = time.perf_counter() - t_publish_start
         state.post_id     = updated.wp_post_id
         state.post_url    = updated.wp_post_url
         state.post_status = updated.publishing.status.value
         state.post_slug   = updated.seo.slug
+
+        # Update editorial image usage history — only for genuinely published articles.
+        # Drafts may read existing history for diversity scoring but must never write it.
+        if image_plan is not None and uploaded_images and state.post_status == "publish":
+            _update_editorial_history(
+                editorial_history,
+                resolved_images=resolved_images,
+                uploaded_images=uploaded_images,
+                slug=updated.seo.slug,
+                post_id=updated.wp_post_id,
+            )
+            console.print(
+                "[dim]Editorial Diversity History:[/dim] Updated — published article recorded"
+            )
+        else:
+            console.print(
+                f"[dim]Editorial Diversity History:[/dim] Not updated — "
+                f"WordPress status is {state.post_status}"
+            )
 
         # ── Post-publish: verify SEO meta acceptance ─────────────
         if state.seo_plugin in (SEOPlugin.YOAST, SEOPlugin.RANKMATH):
@@ -512,6 +1026,16 @@ def _run_publish_flow(
                 f"Post ID: {updated.wp_post_id} — URL: {updated.wp_post_url}"
             )
 
+        # ── Evict from draft pool (published articles are never reusable) ──
+        try:
+            from services.draft_pool_service import DraftPoolService
+            _pool = DraftPoolService(settings.output_dir)
+            _pool.build_or_load()
+            if _pool.remove_entry(article_path):
+                _pool.save()
+        except Exception as _pool_exc:
+            logger.debug("Draft pool eviction skipped: %s", _pool_exc)
+
         # ── Save image report (silent) ───────────────────────────
         if image_plan is not None:
             try:
@@ -521,6 +1045,25 @@ def _run_publish_flow(
                 )
             except Exception as exc:
                 logger.warning("Could not save image resolution report: %s", exc)
+
+        # ── Publication certification ────────────────────────────
+        try:
+            wp_post_data = wp.get_post(updated.wp_post_id) or {} if updated.wp_post_id else {}
+            cert_report = PublicationCertificationService().certify(
+                article=updated,
+                wp_post=wp_post_data,
+                uploaded_images=uploaded_images,
+                seo_qa_report=gate_seo_report,
+                links_added=links_added,
+                no_links=no_links,
+                wp_service=wp,
+                editorial_history=editorial_history if image_plan is not None else None,
+                min_seo_score=effective_min_score,
+                min_word_count=settings.min_article_words,
+            )
+            _display_certification(cert_report)
+        except Exception as exc:
+            logger.warning("Publication certification failed (non-blocking): %s", exc)
 
         # ── Timing and costs ─────────────────────────────────────
         state.t_total = time.perf_counter() - t_total_start
@@ -533,6 +1076,7 @@ def _run_publish_flow(
 
         if show_pipeline_report:
             _display_pipeline_report(state, article, updated)
+            _display_diversity_report(img_stats)
 
         return updated, state
 
@@ -578,6 +1122,9 @@ def publish(
         _display_dry_run(article, report, min_score)
         raise typer.Exit(code=0 if report.is_ready else 1)
 
+    import services.call_tracer as _call_tracer
+    _call_tracer.start()
+
     _run_publish_flow(
         input, article,
         status=status,
@@ -588,38 +1135,38 @@ def publish(
         show_pipeline_report=True,
     )
 
+    _tracer = _call_tracer.get()
+    if _tracer and _tracer.records:
+        console.print(_tracer.summary())
+
 
 # ── Image resolution helper ───────────────────────────────────────────────────
 
-def _resolve_images(article: Article) -> tuple:
+def _resolve_images(article: Article, *, editorial_history: EditorialHistoryService | None = None) -> tuple:
     """
-    Plan and resolve images for an article.
+    Plan and resolve images for an article using the Photo Preservation Pipeline.
 
     Drive images are served from a local SQLite index (DriveImageIndex) that
     is synced from the global DRIVE_FOLDER_ID folder. The index is only
     refreshed when stale (age > DRIVE_SYNC_MAX_AGE_HOURS, default 7 days),
     so most publish runs incur zero Drive API traversal cost.
 
-    Returns (ImagePlacementPlan | None, list[tuple[ImageRequest, ImageAsset]], int).
-    The third element is the number of Drive candidates available from the index.
-    Returns (None, [], 0) if neither Drive nor OpenAI is configured or on error.
+    Returns:
+      (plan, resolved, n_candidates, img_stats)
+
+    Returns (None, [], 0, {}) if Drive is not configured or setup fails.
     Errors are caught and reported as warnings so publishing can continue.
+    The pipeline NEVER generates images from scratch — OpenAI is only used for
+    minimal preservation edits on Drive photos.
     """
     folder_id = settings.drive_folder_id
     drive_svc = None
-    style_svc = None
     generator = None
     drive_candidates = []
 
     if settings.google_sa_json_path and settings.google_sa_json_path.exists() and folder_id:
         try:
             drive_svc = GoogleDriveService(settings.google_sa_json_path)
-            style_svc = VisualStyleService(
-                settings.profiles_dir,
-                drive_svc,
-                claude,
-                settings.image_style_analysis_limit,
-            )
 
             # Sync the Drive index if stale, then load all candidates locally.
             index = DriveImageIndex(settings.drive_index_path)
@@ -638,6 +1185,7 @@ def _resolve_images(article: Article) -> tuple:
         except Exception as exc:
             console.print(f"[yellow]Warning:[/yellow] Drive setup failed: {exc}")
 
+    # OpenAI is only used for P2 preservation edits — not for generation.
     if settings.openai_api_key:
         try:
             generator = OpenAIImageGenerator(settings.openai_api_key, budget=budget)
@@ -646,10 +1194,19 @@ def _resolve_images(article: Article) -> tuple:
 
     n_candidates = len(drive_candidates)
 
-    if not drive_candidates and generator is None:
-        return None, [], 0
+    if not drive_candidates:
+        logger.info("No Drive candidates — image slots will be skipped.")
+        return None, [], 0, {}
 
-    resolver = ImageResolverAgent(claude=claude, drive=drive_svc, generator=generator)
+    resolver = ImageResolverAgent(
+        claude=claude,
+        drive=drive_svc,
+        generator=generator,
+        exact_score=settings.drive_exact_score,
+        partial_score=settings.drive_partial_score,
+        max_ai=settings.max_openai_images_per_article,
+        editorial_history=editorial_history,
+    )
 
     # Phase 1: plan
     try:
@@ -661,34 +1218,364 @@ def _resolve_images(article: Article) -> tuple:
         )
     except Exception as exc:
         console.print(f"[yellow]Warning:[/yellow] Image planning failed — publishing without images: {exc}")
-        return None, [], n_candidates
+        return None, [], n_candidates, {}
 
-    # Load visual style profile (shared across all clients/websites)
-    style_profile = None
-    if style_svc and folder_id:
-        try:
-            with console.status("[bold green]Loading visual style profile...", spinner="dots"):
-                style_profile = style_svc.get_profile(folder_id)
-        except Exception as exc:
-            console.print(f"[yellow]Warning:[/yellow] Visual style profile unavailable: {exc}")
-
-    # Phase 2: resolve — pass pre-fetched candidates from index
+    # Phase 2: resolve using the preservation pipeline
     try:
         with console.status(
             f"[bold green]Resolving {len(plan.requests)} image(s)...", spinner="dots"
         ):
-            resolved = resolver.resolve_all(plan, style_profile, drive_candidates=drive_candidates)
+            resolved = resolver.resolve_all(plan, drive_candidates=drive_candidates)
     except ImageResolverError as exc:
         console.print(f"[yellow]Warning:[/yellow] Image resolution failed — publishing without images: {exc}")
-        return None, [], n_candidates
+        return None, [], n_candidates, {}
     except Exception as exc:
         console.print(f"[yellow]Warning:[/yellow] Unexpected error during image resolution: {exc}")
-        return None, [], n_candidates
+        return None, [], n_candidates, {}
 
-    return plan, resolved, n_candidates
+    return plan, resolved, n_candidates, resolver.last_run_stats
+
+
+# ── Dual QA helper ────────────────────────────────────────────────────────────
+
+def _run_dual_qa(
+    article: Article,
+    resolved_images: list,
+    article_path: Path,
+    *,
+    image_plan: Any = None,
+) -> tuple[Article, list, Any]:
+    """
+    Run the dual QA pipeline (Claude + OpenAI) on the article and any edited images.
+
+    Returns (article, resolved_images, qa_report).
+    article may be a revised version. Edited photos (ImageSource.EDITED) that fail
+    identity preservation QA are reverted to their original Drive photo.
+
+    If image_plan is supplied, DualQAAgent guarantees full marker integrity before
+    returning — no marker repair is needed in the caller.
+
+    On DualQAFailedError: saves QA report to disk, prints the failure report, and
+    raises typer.Exit(code=1) — the article is NOT published.
+    """
+    from models.qa_report import DualQAReport
+
+    openai_reviewer = None
+    if settings.openai_api_key:
+        try:
+            openai_reviewer = OpenAIReviewService(
+                api_key=settings.openai_api_key,
+                text_model=settings.openai_text_review_model,
+                vision_model=settings.openai_vision_review_model,
+            )
+        except Exception as exc:
+            console.print(f"[yellow]Warning:[/yellow] OpenAI reviewer setup failed — Claude-only QA: {exc}")
+    else:
+        console.print("[yellow]Warning:[/yellow] OPENAI_API_KEY not set — running Claude-only dual QA.")
+
+    qa_agent = DualQAAgent(
+        claude=claude,
+        openai_reviewer=openai_reviewer,
+        min_seo=settings.qa_min_seo,
+        min_editorial=settings.qa_min_editorial,
+        min_writing=settings.qa_min_writing,
+        min_authenticity=settings.qa_min_authenticity,
+        min_vision_claude=settings.qa_min_vision_claude,
+        min_vision_openai=settings.qa_min_vision_openai,
+        max_cycles=settings.qa_max_cycles,
+    )
+
+    try:
+        with console.status(
+            f"[bold green]Dual QA review (max {settings.qa_max_cycles} cycle(s))...",
+            spinner="dots",
+        ):
+            approved_article, approved_images, report = qa_agent.run(
+                article, resolved_images,
+                image_plan=image_plan,
+            )
+
+        # Show brief QA summary
+        r = report.final_article_review
+        if r:
+            console.print(
+                f"  [dim]Dual QA:[/dim] [green]PASS[/green]  "
+                f"SEO={r.seo_score} Editorial={r.editorial_score} "
+                f"Writing={r.writing_score} Authenticity={r.authenticity_score}  "
+                f"({report.iterations_used} cycle(s))"
+            )
+        removed = len(resolved_images) - len(approved_images)
+        if removed:
+            console.print(f"  [dim]Images:[/dim] {removed} AI image(s) excluded by vision review.")
+
+        _save_qa_report(article_path, report)
+        return approved_article, approved_images, report
+
+    except DualQAFailedError as exc:
+        report = exc.report
+        _save_qa_report(article_path, report)
+        _display_qa_failure(report, article_path)
+        raise typer.Exit(code=1)
+
+
+def _update_editorial_history(
+    history: Any,
+    *,
+    resolved_images: list,
+    uploaded_images: list,
+    slug: str,
+    post_id: int | None,
+) -> None:
+    """Record published images in the editorial diversity database."""
+    from models.image_asset import ImageSource
+    from models.image_request import ImagePurpose
+    from datetime import datetime, timezone
+
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    uploaded_ids = {req.id for req, _ in uploaded_images}
+    resolved_map = {req.id: (req, asset) for req, asset in resolved_images}
+
+    for img_id in uploaded_ids:
+        pair = resolved_map.get(img_id)
+        if pair is None:
+            continue
+        req, asset = pair
+        file_id = None
+        if asset.source == ImageSource.DRIVE:
+            file_id = asset.source_detail
+        elif asset.source == ImageSource.EDITED:
+            file_id = asset.reference_file_id
+        if not file_id:
+            continue
+        history.record_publication(
+            file_id=file_id,
+            filename=asset.filename or "",
+            slug=slug,
+            post_id=post_id,
+            purpose="featured" if req.purpose == ImagePurpose.FEATURED else "inline",
+            date=today,
+        )
+
+    history.finalize_article(slug)
+    history.save()
+
+
+def _display_diversity_report(img_stats: dict) -> None:
+    div = img_stats.get("diversity_report")
+    if not div or not div.get("selections"):
+        return
+
+    table = Table(show_header=False, box=box.SIMPLE, padding=(0, 1))
+    table.add_column("Field", style="dim", min_width=28)
+    table.add_column("Value", overflow="fold")
+
+    table.add_row("Candidates evaluated by Vision", str(div.get("candidates_considered", 0)))
+    table.add_row("Excluded by recency", str(div.get("excluded_recent", 0)))
+    table.add_row("Excluded by folder duplicate", str(div.get("excluded_folder_duplicate", 0)))
+    table.add_row("Previously unused images selected", str(div.get("previously_unused", 0)))
+
+    for sel in div.get("selections", []):
+        table.add_row("", "")
+        slot_label = "Featured Image" if sel.get("purpose") == "featured" else sel.get("slot", "?")
+        vision_color = "green" if sel.get("vision_score", 0) >= 75 else "yellow"
+        ed_score = sel.get("editorial_score", 0)
+        ed_color = "green" if ed_score >= 80 else "yellow" if ed_score >= 60 else "dim"
+        table.add_row(slot_label, "")
+        table.add_row("  Vision score", f"[{vision_color}]{sel.get('vision_score', '?')}[/{vision_color}]")
+        table.add_row("  Editorial score", f"[{ed_color}]{ed_score:.1f}[/{ed_color}]")
+        table.add_row("  Times used", str(sel.get("times_used", "?")))
+        table.add_row("  Reason", str(sel.get("reason", ""))[:100])
+
+    console.print()
+    console.print(Panel(table, title="[bold]Image Diversity Report[/bold]", expand=False))
+
+
+def _save_qa_report(article_path: Path, report: Any) -> None:
+    """Save the full QA report + per-cycle JSONs inside a qa/ subdirectory."""
+    import json as _json
+    try:
+        qa_dir = article_path.parent / "qa"
+        qa_dir.mkdir(parents=True, exist_ok=True)
+
+        # Full consolidated report
+        (qa_dir / "report.json").write_text(
+            _json.dumps(report.to_dict(), indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+
+        # Per-cycle files — one per article review iteration
+        for iteration in report.article_iterations:
+            cycle_path = qa_dir / f"cycle-{iteration.iteration}.json"
+            cycle_path.write_text(
+                _json.dumps(iteration.to_dict(), indent=2, ensure_ascii=False), encoding="utf-8"
+            )
+    except Exception as exc:
+        logger.warning("Could not save QA report: %s", exc)
+
+
+def _display_qa_failure(report: Any, article_path: Path) -> None:
+    """Display the QA failure report when max cycles are exhausted."""
+    from rich.rule import Rule
+
+    console.print()
+    console.print(Rule("[bold red]DUAL QA FAILED — Article Not Published[/bold red]"))
+    console.print()
+    console.print(f"  The article failed quality review after {report.iterations_used} revision cycle(s).")
+    console.print(f"  The best revision has been saved to: [dim]{article_path}[/dim]")
+    console.print(f"  Full QA report: [dim]{article_path.parent / 'qa' / 'report.json'}[/dim]")
+    console.print()
+
+    final = report.final_article_review
+    if final:
+        # ── Score summary table ───────────────────────────────────────────────
+        table = Table(show_header=True, box=box.SIMPLE, padding=(0, 1))
+        table.add_column("Reviewer", style="bold", min_width=20)
+        table.add_column("Dimension", min_width=16)
+        table.add_column("Score", min_width=8)
+        table.add_column("Required", min_width=8)
+        table.add_column("Priority", min_width=8)
+        table.add_column("", min_width=6)
+
+        def _pass_fail(score: int, required: int) -> str:
+            return "[green]PASS[/green]" if score >= required else "[red]FAIL[/red]"
+
+        def _priority_fmt(p: str) -> str:
+            colors = {"High": "red", "Medium": "yellow", "Low": "dim"}
+            c = colors.get(p, "dim")
+            return f"[{c}]{p}[/{c}]" if p else "—"
+
+        table.add_row(
+            "Claude (SEO Editor)", "SEO Quality",
+            str(final.seo_score), "≥ 90",
+            _priority_fmt(final.seo_detail.priority),
+            _pass_fail(final.seo_score, 90),
+        )
+        table.add_row(
+            "", "Editorial Quality",
+            str(final.editorial_score), "≥ 90",
+            _priority_fmt(final.editorial_detail.priority),
+            _pass_fail(final.editorial_score, 90),
+        )
+        table.add_row(
+            "OpenAI (Authenticity)", "Human Writing",
+            str(final.writing_score), "≥ 90",
+            _priority_fmt(final.writing_detail.priority),
+            _pass_fail(final.writing_score, 90),
+        )
+        table.add_row(
+            "", "Authenticity",
+            str(final.authenticity_score), "≥ 90",
+            _priority_fmt(final.authenticity_detail.priority),
+            _pass_fail(final.authenticity_score, 90),
+        )
+        console.print(table)
+
+        # ── Per-dimension explanation for every failed dimension ──────────────
+        failed_dims = final.failed_dimensions()
+        if failed_dims:
+            console.print()
+            console.print("  [bold]Why the article failed:[/bold]")
+            console.print()
+            for label, score, detail in failed_dims:
+                console.print(f"  [bold red]{label}[/bold red]  [dim]{score}/100[/dim]")
+                if detail.reasoning:
+                    console.print(f"  [dim]{detail.reasoning}[/dim]")
+                if detail.weaknesses:
+                    console.print()
+                    console.print("  [bold]Reasons:[/bold]")
+                    for w in detail.weaknesses:
+                        console.print(f"    [dim]•[/dim] {w}")
+                if detail.improvements:
+                    console.print()
+                    console.print("  [bold]Improvements:[/bold]")
+                    for imp in detail.improvements:
+                        console.print(f"    [dim]→[/dim] {imp}")
+                console.print()
+
+    # ── Revision compliance history ───────────────────────────────────────────
+    all_iterations = getattr(report, "article_iterations", [])
+    compliance_iters = [it for it in all_iterations if it.revision_attempts]
+    if compliance_iters:
+        console.print()
+        console.print("  [bold]Revision compliance history:[/bold]")
+        console.print()
+        for it in compliance_iters:
+            attempts = it.revision_attempts
+            evaluable = [a for a in attempts if a.evaluable]
+            not_evaluable = [a for a in attempts if not a.evaluable]
+            applied_count = sum(1 for a in evaluable if a.applied)
+            rate_pct = int(100 * applied_count / len(evaluable)) if evaluable else 0
+            rate_color = "green" if rate_pct >= 80 else "yellow" if rate_pct >= 50 else "red"
+
+            summary = (
+                f"[{rate_color}]{applied_count}/{len(evaluable)} applied ({rate_pct}%)[/{rate_color}]"
+            )
+            if not_evaluable:
+                summary += f"  [dim]{len(not_evaluable)} not evaluable[/dim]"
+            console.print(f"  Cycle {it.iteration} revision — {summary}")
+
+            # Instructions not applied (these explain the plateau)
+            not_applied = [a for a in evaluable if not a.applied]
+            if not_applied:
+                console.print("    Instructions [red]not applied[/red]:")
+                for a in not_applied:
+                    pri = f"[red]{a.priority}[/red]" if a.priority == "High" else f"[dim]{a.priority}[/dim]"
+                    console.print(f"      [{pri}] {a.instruction}")
+                    if a.evidence:
+                        console.print(f"             [dim]{a.evidence}[/dim]")
+
+            # Not-evaluable instructions listed separately, not as failures
+            if not_evaluable:
+                console.print("    Instructions [dim]not evaluable[/dim] (excluded from score):")
+                for a in not_evaluable:
+                    console.print(f"      [dim]—[/dim] {a.instruction}")
+                    if a.evidence:
+                        console.print(f"             [dim]{a.evidence}[/dim]")
+        console.print()
+
+    if report.rejection_reasons:
+        console.print("  [bold]Rejection summary:[/bold]")
+        for reason in report.rejection_reasons:
+            console.print(f"    [dim]•[/dim] {reason}")
+        console.print()
 
 
 # ── Display helpers ───────────────────────────────────────────────────────────
+
+def _display_site_validation(result: SiteValidationResult, site_url: str) -> None:
+    status_colors = {"READY": "green", "READY_WITH_WARNINGS": "yellow", "FAILED": "red"}
+    status_icons = {"READY": "✓", "READY_WITH_WARNINGS": "⚠", "FAILED": "✗"}
+    color = status_colors[result.status]
+    icon = status_icons[result.status]
+
+    table = Table(show_header=False, box=box.SIMPLE, padding=(0, 1))
+    table.add_column("Check", style="dim", min_width=22)
+    table.add_column("Result", overflow="fold")
+
+    table.add_row("Site", site_url)
+    table.add_row(
+        "REST API",
+        "[green]Reachable[/green]" if result.rest_api_reachable else "[red]Unreachable[/red]",
+    )
+    table.add_row(
+        "Authentication",
+        f"[green]OK[/green] ({result.auth_user})" if result.auth_ok else "[red]FAILED[/red]",
+    )
+    seo_label = result.seo_plugin.value if result.seo_plugin != SEOPlugin.NONE else "None detected"
+    seo_style = "green" if result.seo_plugin != SEOPlugin.NONE else "yellow"
+    table.add_row("SEO Plugin", f"[{seo_style}]{seo_label}[/{seo_style}]")
+    table.add_row(
+        "seo-agent.php",
+        "[green]Installed[/green]" if result.agent_plugin_installed else "[yellow]Not detected[/yellow]",
+    )
+
+    if result.errors:
+        for err in result.errors:
+            table.add_row(f"[{color}]Issue[/{color}]", err)
+
+    title = f"[bold][{color}]{icon} Site Validation — {result.status}[/{color}][/bold]"
+    console.print()
+    console.print(Panel(table, title=title, expand=False))
+
 
 def _display_dry_run(article: Article, report: DryRunReport, min_score: int) -> None:
     status_icon = "[green]✓[/green]" if report.is_ready else "[red]✗[/red]"
@@ -791,6 +1678,221 @@ def _display_qa_report(report: SEOReport, min_score: int) -> None:
     console.print(Panel(table, title=qa_title, expand=False))
 
 
+def _display_location_scan(report: "ScanReport") -> None:
+    """Print a compact summary of the location adaptation pass."""
+    if report.sections_with_refs == 0:
+        console.print(
+            f"  [dim]Location scan: No '{report.original_city}' references found — body clean.[/dim]"
+        )
+        return
+
+    summary = (
+        f"  [dim]Location scan:[/dim] {report.sections_with_refs} section(s) "
+        f"'{report.original_city}' → '{report.target_city}'"
+    )
+    if report.sections_llm_rewritten:
+        summary += f"  [dim]({report.sections_llm_rewritten} AI-refined)[/dim]"
+    if report.sections_llm_budget_skipped:
+        summary += (
+            f"  [dim]{report.sections_llm_budget_skipped} AI refinement(s) skipped "
+            f"(monthly budget exceeded — direct adaptation retained)[/dim]"
+        )
+    console.print(summary)
+
+
+def _display_reuse_stats(report: dict) -> None:
+    """Print the monthly reuse statistics panel after every generate/autopublish run."""
+    from rich.table import Table
+
+    table = Table(show_header=False, box=box.SIMPLE, padding=(0, 1))
+    table.add_column("Label", style="dim", min_width=26)
+    table.add_column("Value", overflow="fold")
+
+    month = report["month"]
+    total = report["total_articles"]
+    generated = report["articles_generated"]
+    reused = report["articles_reused"]
+    reuse_pct = report["reuse_percentage"]
+    avoided = report["api_calls_avoided"]
+    saved = report["dollars_saved"]
+    avg_cost = report["average_article_cost"]
+    monthly_cost = report["total_cost_usd"]
+    seo_hits = report["seo_cache_hits"]
+    seo_skipped = report["seo_regens_skipped"]
+    pool_hits = report["pool_hits"]
+    location_adapted = report["location_adapted"]
+    loc_skipped = report["location_refinements_skipped"]
+    budget_gen_blocks = report["budget_blocks_generation"]
+    budget_minor_blocks = report["budget_blocks_minor"]
+    top_topics = report["most_reused_topics"]
+
+    reuse_color = "green" if reuse_pct >= 50 else "yellow" if reuse_pct >= 20 else "dim"
+    table.add_row("Month", month)
+    table.add_row(
+        "Articles this month",
+        f"{total} total  "
+        f"([green]{generated} generated[/green] / [{reuse_color}]{reused} reused[/{reuse_color}])",
+    )
+    table.add_row(
+        "Reuse rate",
+        f"[{reuse_color}]{reuse_pct:.1f}%[/{reuse_color}]",
+    )
+    table.add_row("API calls avoided", str(avoided))
+    table.add_row(
+        "Estimated savings",
+        f"[green]~${saved:.2f}[/green]",
+    )
+    table.add_row(
+        "Avg article cost",
+        f"${avg_cost:.4f}" if avg_cost else "[dim]$0.0000[/dim]",
+    )
+    table.add_row(
+        "Monthly API spend",
+        f"${monthly_cost:.4f}",
+    )
+    if seo_hits:
+        table.add_row("SEO cache hits", str(seo_hits))
+    if pool_hits:
+        table.add_row("Pool lookups (fast)", str(pool_hits))
+    if location_adapted:
+        table.add_row("Location-adapted", str(location_adapted))
+    # ── Budget-skip counters (only shown when non-zero) ───────────────────────
+    if seo_skipped:
+        table.add_row(
+            "SEO regens skipped",
+            f"[dim]{seo_skipped} (budget limit — existing SEO reused)[/dim]",
+        )
+    if loc_skipped:
+        table.add_row(
+            "Location AI skipped",
+            f"[dim]{loc_skipped} section(s) (budget limit — direct replacement retained)[/dim]",
+        )
+    if budget_gen_blocks:
+        table.add_row(
+            "Generation blocked",
+            f"[yellow]{budget_gen_blocks} (budget limit — no draft available)[/yellow]",
+        )
+    if budget_minor_blocks and not seo_skipped and not loc_skipped:
+        table.add_row(
+            "Minor adaptations skipped",
+            f"[dim]{budget_minor_blocks} (budget limit)[/dim]",
+        )
+    if top_topics:
+        topic_str = "  ".join(f"{t} ×{n}" for t, n in top_topics[:3])
+        table.add_row("Most reused topics", f"[dim]{topic_str}[/dim]")
+
+    console.print()
+    console.print(Panel(table, title=f"[bold]Reuse Stats — {month}[/bold]", expand=False))
+
+
+def _display_cost_report(
+    *,
+    claude_cost: float,
+    openai_cost: float,
+    article_cost: float,
+    monthly_total: float,
+    monthly_limit: float,
+    article_limit: float,
+    reused: bool,
+    reuse_match: "DraftMatch | None",
+) -> None:
+    """Print a concise cost summary after every generate / autopublish run."""
+    table = Table(show_header=False, box=box.SIMPLE, padding=(0, 1))
+    table.add_column("Label", style="dim", min_width=24)
+    table.add_column("Value", overflow="fold")
+
+    if reused:
+        table.add_row("Article", "[green]Reused (no API calls)[/green]")
+        if reuse_match:
+            savings_est = round(article_limit, 4)
+            table.add_row("Estimated savings", f"[green]~${savings_est:.2f}[/green]")
+        claude_cost_str = "[dim]$0.000000[/dim]"
+        openai_cost_str = "[dim]$0.000000[/dim]"
+        article_cost_str = "[dim]$0.000000[/dim]"
+    else:
+        table.add_row("Article", "Generated")
+        over = article_cost > article_limit
+        cost_color = "red" if over else "green"
+        article_cost_str = f"[{cost_color}]${article_cost:.6f}[/{cost_color}]"
+        if over:
+            table.add_row(
+                "Per-article target",
+                f"[red]${article_cost:.4f} > ${article_limit:.2f} limit[/red]",
+            )
+        claude_cost_str = f"${claude_cost:.6f}"
+        openai_cost_str = f"${openai_cost:.6f}"
+
+    table.add_row("Claude cost", claude_cost_str)
+    table.add_row("OpenAI cost", openai_cost_str)
+    table.add_row("This article total", article_cost_str if not reused else "[dim]$0.000000[/dim]")
+
+    monthly_pct = min(100.0, 100 * monthly_total / monthly_limit) if monthly_limit > 0 else 0.0
+    monthly_color = "red" if monthly_pct >= 90 else "yellow" if monthly_pct >= 70 else "green"
+    table.add_row(
+        "Monthly spend",
+        f"[{monthly_color}]${monthly_total:.4f} / ${monthly_limit:.2f}[/{monthly_color}]"
+        f"  [dim]({monthly_pct:.1f}% used)[/dim]",
+    )
+
+    console.print()
+    console.print(Panel(table, title="[bold]Cost Report[/bold]", expand=False))
+
+
+def _display_sanitization(result: SanitizationResult) -> None:
+    if not result.changed:
+        return
+    table = Table(show_header=False, box=box.SIMPLE, padding=(0, 1))
+    table.add_column("", min_width=14)
+    table.add_column("Removed", overflow="fold")
+    for label in result.removed:
+        table.add_row("[dim]artifact[/dim]", label)
+    console.print()
+    console.print(Panel(table, title="[bold yellow]Content Sanitization — Artifacts Removed[/bold yellow]", expand=False))
+
+
+def _display_readiness_gate(readiness: ReadinessResult) -> None:
+    title = (
+        "[bold green]Publication Readiness — READY[/bold green]"
+        if readiness.ready
+        else "[bold red]Publication Readiness — NOT READY[/bold red]"
+    )
+    table = Table(show_header=False, box=box.SIMPLE, padding=(0, 1))
+    table.add_column("", min_width=4)
+    table.add_column("Check", min_width=22)
+    table.add_column("Detail", overflow="fold", style="dim")
+    for check in readiness.checks:
+        if check.passed:
+            icon = "[green]✓[/green]"
+        elif check.blocking:
+            icon = "[red]✗[/red]"
+        else:
+            icon = "[yellow]⚠[/yellow]"
+        table.add_row(icon, check.name, check.detail)
+    console.print()
+    console.print(Panel(table, title=title, expand=False))
+
+
+def _display_certification(report: CertificationReport) -> None:
+    title = (
+        "[bold green]Publication Certification — CERTIFIED[/bold green]"
+        if report.certified
+        else "[bold red]Publication Certification — NOT CERTIFIED[/bold red]"
+    )
+    current_section = ""
+    table = Table(show_header=False, box=box.SIMPLE, padding=(0, 1))
+    table.add_column("", min_width=4)
+    table.add_column("Check", min_width=26)
+    table.add_column("Detail", overflow="fold", style="dim")
+    for item in report.items:
+        if item.section != current_section:
+            table.add_row("", f"[bold]{item.section}[/bold]", "")
+            current_section = item.section
+        icon = "[green]✓[/green]" if item.passed else "[red]✗[/red]"
+        table.add_row(icon, item.name, item.detail)
+    console.print()
+    console.print(Panel(table, title=title, expand=False))
+
+
 def _display_image_resolution(
     plan: Any,
     resolved: list,
@@ -832,22 +1934,30 @@ def _display_image_resolution(
 
         _, asset = pair
         if asset.source == ImageSource.DRIVE:
-            table.add_row(section_label, "[green]✓ Found[/green]")
+            table.add_row(section_label, "[green]✓ Drive original[/green]")
             if asset.similarity_score is not None:
                 table.add_row("  Similarity", f"{asset.similarity_score}%")
             if asset.drive_path:
                 table.add_row("  Path", asset.drive_path)
             if asset.selection_reason:
                 table.add_row("  Reason", asset.selection_reason[:120])
+        elif asset.source == ImageSource.EDITED:
+            edit_desc = asset.edit_type or "preservation edit"
+            preserved = f" ({asset.preservation_estimate}% preserved)" if asset.preservation_estimate else ""
+            table.add_row(section_label, f"[yellow]~ Drive photo with {edit_desc}{preserved}[/yellow]")
+            if asset.drive_path:
+                table.add_row("  Original", asset.drive_path)
+            if asset.ai_reason:
+                table.add_row("  Reason", asset.ai_reason[:120])
         else:
-            table.add_row(section_label, "[yellow]↑ OpenAI generated[/yellow]")
+            table.add_row(section_label, "[dim]Not resolved[/dim]")
             if asset.selection_reason:
-                table.add_row("  Reason", asset.selection_reason)
+                table.add_row("  Reason", asset.selection_reason[:120])
 
     table.add_row("", "")
 
-    drive_used = sum(1 for _, a in resolved if a.source == ImageSource.DRIVE)
-    openai_used = sum(1 for _, a in resolved if a.source == ImageSource.GENERATED)
+    drive_used   = sum(1 for _, a in resolved if a.source == ImageSource.DRIVE)
+    edited_count = sum(1 for _, a in resolved if a.source == ImageSource.EDITED)
     uploaded_count = len(uploaded) if uploaded else 0
     inline_count = sum(
         1 for req, _ in (uploaded or [])
@@ -858,7 +1968,7 @@ def _display_image_resolution(
         for req, meta in (uploaded or [])
     )
 
-    table.add_row("OpenAI Images generated", str(openai_used))
+    table.add_row("Preservation edits", str(edited_count))
     table.add_row("Images uploaded to WordPress", str(uploaded_count))
     table.add_row("Images inserted into article", str(inline_count))
     table.add_row(
@@ -922,26 +2032,33 @@ def _save_image_report(
 
         _, asset = pair
         is_drive = asset.source == ImageSource.DRIVE
+        is_edited = asset.source == ImageSource.EDITED
 
         images.append({
             **base,
             "source":                     asset.source.value,
             "drive_file_id":              asset.source_detail if is_drive else None,
+            "reference_file_id":          asset.reference_file_id if is_edited else None,
             "drive_path":                 asset.drive_path,
             "similarity_score":           asset.similarity_score,
             "drive_candidates_evaluated": asset.drive_candidates_evaluated,
             "selection_reason":           asset.selection_reason,
             "vision_reasoning":           asset.vision_reasoning,
-            "openai_prompt":              asset.source_detail if not is_drive else None,
+            "ai_reason":                  asset.ai_reason,
+            "edit_type":                  asset.edit_type if is_edited else None,
+            "edit_prompt":                asset.edit_prompt if is_edited else None,
+            "preservation_estimate":      asset.preservation_estimate if is_edited else None,
+            "edit_prompt_openai":         asset.source_detail if is_edited else None,
             "wordpress_media_id":         meta.wordpress_media_id if meta else None,
         })
 
     # ── Summary stats ─────────────────────────────────────────────────────────
-    drive_assets = [a for _, a in resolved if a.source == ImageSource.DRIVE]
-    ai_assets    = [a for _, a in resolved if a.source == ImageSource.GENERATED]
+    drive_assets  = [a for _, a in resolved if a.source == ImageSource.DRIVE]
+    edited_assets = [a for _, a in resolved if a.source == ImageSource.EDITED]
 
     similarity_scores = [
-        a.similarity_score for a in drive_assets if a.similarity_score is not None
+        a.similarity_score for a in drive_assets + edited_assets
+        if a.similarity_score is not None
     ]
     avg_similarity = (
         round(sum(similarity_scores) / len(similarity_scores), 1)
@@ -972,12 +2089,12 @@ def _save_image_report(
         "summary": {
             "images_requested":           len(plan.requests),
             "images_resolved":            len(resolved),
-            "drive_selected":             len(drive_assets),
-            "openai_generated":           len(ai_assets),
+            "drive_originals_used":       len(drive_assets),
+            "preservation_edits":         len(edited_assets),
             "drive_candidates_available": drive_count,
             "avg_similarity_score":       avg_similarity,
             "featured_assigned":          featured_ok,
-            "openai_cost_estimate_usd":   round(len(ai_assets) * 0.12, 4),
+            "openai_edit_cost_estimate_usd": round(len(edited_assets) * 0.04, 4),
         },
         "images":       images,
         "folder_usage": dict(
@@ -1079,21 +2196,129 @@ def _display_pipeline_report(
         reason = state.images_skip_reason or "skipped"
         _row("Status:", f"[dim]Skipped — {reason}[/dim]")
     else:
-        _row("Drive images indexed:", str(state.drive_indexed))
-        _row("Images requested:",     str(state.img_requested))
-        _row("Resolved from Drive:",  str(state.img_from_drive))
-        _row("Generated by OpenAI:",  str(state.img_from_openai))
-        _row("Uploaded to WordPress:", str(state.img_uploaded))
+        _row("Drive images indexed:",       str(state.drive_indexed))
+        _row("Semantic candidates:",        str(state.drive_semantic_candidates))
+        _row("Images requested:",          str(state.img_requested))
+        _row("Drive originals (P1):",      f"[green]{state.img_from_drive}[/green]" if state.img_from_drive else "[dim]0[/dim]")
+        _row("Preservation edits (P2):",   f"[yellow]{state.img_from_edited}[/yellow]" if state.img_from_edited else "[dim]0[/dim]")
+        _row(
+            "Edit budget:",
+            f"{state.img_from_edited}/{state.openai_budget_total} used  "
+            f"([dim]{state.openai_budget_remaining} remaining[/dim])",
+        )
+        _row("Uploaded to WordPress:",     str(state.img_uploaded))
         _row(
             "Featured Image:",
             "[green]Assigned[/green]" if state.img_featured else "[dim]Not assigned[/dim]",
         )
+        if state.edited_photos:
+            console.print("   [dim]Preservation edits:[/dim]")
+            for ref in state.edited_photos:
+                score_str = f"score={ref.get('score', '?')}"
+                drive_path = ref.get("drive_path") or "unknown"
+                edit_type = ref.get("edit_type") or "edit"
+                preserved = ref.get("preserved")
+                preserved_str = f"  [dim]{preserved}% preserved[/dim]" if preserved else ""
+                console.print(
+                    f"     [yellow]~[/yellow] {ref.get('id', '?')}  "
+                    f"[dim]src:[/dim] {drive_path}  [dim]({score_str}, {edit_type})[/dim]{preserved_str}"
+                )
+        if state.ai_reasons and not state.edited_photos:
+            console.print("   [dim]Edit reasons:[/dim]")
+            for reason_text in state.ai_reasons:
+                console.print(f"     [dim]• {reason_text}[/dim]")
         for err in state.img_errors:
             console.print(f"   [red]✗ Upload error:[/red] {err}")
     console.print()
 
-    # ── 4. HTML Content ───────────────────────────────────────────
-    _section("4. HTML Content")
+    # ── 4. Dual QA ────────────────────────────────────────────────
+    _section("4. Dual QA")
+    if not state.dual_qa_enabled:
+        _row("Status:", "[dim]Skipped (QA_ENABLED=False)[/dim]")
+    else:
+        overall = "[green]PASS[/green]" if state.dual_qa_passed else "[red]FAIL[/red]"
+        _row("Overall decision:", overall)
+        _row("Review cycles:", str(state.dual_qa_iterations))
+        console.print()
+        console.print("   [bold dim]Article[/bold dim]")
+
+        def _score_fmt(score: int, required: int = 90) -> str:
+            color = "green" if score >= required else "red"
+            return f"[{color}]{score}/100[/{color}]"
+
+        _row("  Claude SEO:",       _score_fmt(state.dual_qa_seo_score))
+        _row("  Claude Editorial:", _score_fmt(state.dual_qa_editorial_score))
+        _row("  OpenAI Writing:",   _score_fmt(state.dual_qa_writing_score))
+        _row("  OpenAI Authenticity:", _score_fmt(state.dual_qa_authenticity_score))
+        _row("  Combined:",         f"{state.dual_qa_combined_score:.1f}/100")
+
+        if state.dual_qa_images_reviewed > 0:
+            console.print()
+            console.print("   [bold dim]Preservation Edits[/bold dim]")
+            _row("  Reviewed:", str(state.dual_qa_images_reviewed))
+            _row(
+                "  Passed:",
+                f"[green]{state.dual_qa_images_passed}[/green]"
+                if state.dual_qa_images_passed else "[dim]0[/dim]",
+            )
+            if state.dual_qa_images_failed:
+                _row("  Failed:", f"[red]{state.dual_qa_images_failed}[/red]")
+                for img_r in state.dual_qa_image_results:
+                    if not img_r.approved:
+                        console.print(
+                            f"     [red]✗[/red] {img_r.image_id}  "
+                            f"Claude={img_r.claude_vision_score}  "
+                            f"OpenAI={img_r.openai_vision_score}"
+                        )
+
+        if state.dual_qa_rejection_reasons:
+            console.print()
+            console.print("   [dim]Rejection reasons:[/dim]")
+            for reason in state.dual_qa_rejection_reasons:
+                console.print(f"     [dim]• {reason}[/dim]")
+    console.print()
+
+    # ── 5. Authenticity Report ────────────────────────────────────
+    if state.dual_qa_enabled:
+        _section("5. Authenticity Report")
+        auth_label = state.dual_qa_authenticity_label or "—"
+        auth_color = {
+            "Excellent":          "green",
+            "Very Good":          "green",
+            "Good":               "yellow",
+            "Fair":               "yellow",
+            "Needs Improvement":  "red",
+        }.get(auth_label, "dim")
+        _row("Overall authenticity:", f"[{auth_color}]{state.dual_qa_overall_authenticity:.1f}/100  ({auth_label})[/{auth_color}]")
+        _row("Article authenticity:", f"{state.dual_qa_article_authenticity:.1f}/100")
+        if state.dual_qa_image_authenticity is not None:
+            _row("Image authenticity:",  f"{state.dual_qa_image_authenticity:.1f}/100")
+        if state.dual_qa_authenticity_narrative:
+            console.print(f"   [dim]{state.dual_qa_authenticity_narrative}[/dim]")
+        console.print()
+
+    # ── 6. QA Cost Report ─────────────────────────────────────────
+    if state.dual_qa_enabled:
+        _section("6. QA Cost Report")
+        _row("Claude review cost:",     f"[cyan]${state.dual_qa_claude_review_cost:.4f}[/cyan]")
+        _row("OpenAI review cost:",     f"[cyan]${state.dual_qa_openai_review_cost:.4f}[/cyan]")
+        if state.dual_qa_revision_cost > 0:
+            _row("Revision cost:",      f"[cyan]${state.dual_qa_revision_cost:.4f}[/cyan]")
+        vision_total = state.dual_qa_vision_claude_cost + state.dual_qa_vision_openai_cost
+        if vision_total > 0:
+            _row("Vision review cost:", f"[cyan]${vision_total:.4f}[/cyan]"
+                 f"  [dim](Claude ${state.dual_qa_vision_claude_cost:.4f} + OpenAI ${state.dual_qa_vision_openai_cost:.4f})[/dim]")
+        _row("Total QA cost:",          f"[bold cyan]${state.dual_qa_total_cost:.4f}[/bold cyan]")
+        def _fmt_s_qa(s: float) -> str:
+            return f"{s:.1f}s" if s >= 0.1 else "[dim]—[/dim]"
+        _row("QA time:",                _fmt_s_qa(state.dual_qa_elapsed_seconds))
+        _row("Review cycles:",          str(state.dual_qa_iterations))
+        if state.dual_qa_avg_cycle_seconds > 0:
+            _row("Avg cycle time:",     _fmt_s_qa(state.dual_qa_avg_cycle_seconds))
+        console.print()
+
+    # ── 7. HTML Content ───────────────────────────────────────────
+    _section("7. HTML Content")
     _row("Tables:",        f"[green]✓[/green] ({state.html_tables})" if state.html_tables else f"[dim]none[/dim]")
     _row("Callouts:",      f"[green]✓[/green] ({state.html_callouts})" if state.html_callouts else f"[dim]none[/dim]")
     _row("FAQ section:",   "[green]✓[/green]" if state.html_faq else "[dim]not found[/dim]")
@@ -1101,8 +2326,8 @@ def _display_pipeline_report(
     _row("External links:", str(state.html_external_links))
     console.print()
 
-    # ── 5. Published ──────────────────────────────────────────────
-    _section("5. Published")
+    # ── 8. Published ─────────────────────────────────────────────
+    _section("8. Published")
     _row("Status:", f"[green]{state.post_status}[/green]")
     _row("Post ID:", str(state.post_id))
     _row("Slug:",    state.post_slug)
@@ -1110,8 +2335,8 @@ def _display_pipeline_report(
         _row("URL:", state.post_url)
     console.print()
 
-    # ── 6. Timing ─────────────────────────────────────────────────
-    _section("6. Timing")
+    # ── 9. Timing ────────────────────────────────────────────────
+    _section("9. Timing")
     def _fmt_s(s: float) -> str:
         return f"{s:.1f}s" if s >= 0.1 else "[dim]—[/dim]"
     _row("Image resolution:", _fmt_s(state.t_images))
@@ -1120,8 +2345,8 @@ def _display_pipeline_report(
     _row("Total pipeline:",   f"[bold]{_fmt_s(state.t_total)}[/bold]")
     console.print()
 
-    # ── 7. Costs ──────────────────────────────────────────────────
-    _section("7. Costs")
+    # ── 10. Costs ────────────────────────────────────────────────
+    _section("10. Costs")
     _row("Claude input tokens:",  f"{state.claude_input_tokens:,}")
     _row("Claude output tokens:", f"{state.claude_output_tokens:,}")
     _row("Claude cost:",          f"[cyan]${state.claude_cost_usd:.4f}[/cyan]")
@@ -1132,6 +2357,56 @@ def _display_pipeline_report(
     _row("Total run cost:",       f"[bold cyan]${total_cost:.4f}[/bold cyan]")
     console.print()
     console.print(Rule())
+
+    # ── Final Summary Panel ───────────────────────────────────────
+    console.print()
+    summary_table = Table(show_header=False, box=box.SIMPLE, padding=(0, 1))
+    summary_table.add_column("", style="dim", min_width=24)
+    summary_table.add_column("", overflow="fold")
+
+    decision_label = f"[bold green]PUBLISHED ({state.post_status.upper()})[/bold green]"
+    summary_table.add_row("Decision", decision_label)
+
+    if state.dual_qa_enabled:
+        pr_score = state.dual_qa_publication_readiness
+        pr_color = "green" if pr_score >= 90 else "yellow" if pr_score >= 80 else "red"
+        summary_table.add_row(
+            "Publication Readiness",
+            f"[bold {pr_color}]{pr_score:.1f}/100[/bold {pr_color}]",
+        )
+        auth_lbl = state.dual_qa_authenticity_label or "—"
+        auth_col = {
+            "Excellent": "green", "Very Good": "green",
+            "Good": "yellow", "Fair": "yellow", "Needs Improvement": "red",
+        }.get(auth_lbl, "dim")
+        summary_table.add_row(
+            "Authenticity",
+            f"[{auth_col}]{state.dual_qa_overall_authenticity:.1f}/100  ({auth_lbl})[/{auth_col}]",
+        )
+        summary_table.add_row(
+            "QA Cost",
+            f"${state.dual_qa_total_cost:.4f}",
+        )
+        summary_table.add_row(
+            "QA Time",
+            _fmt_s(state.dual_qa_elapsed_seconds),
+        )
+        summary_table.add_row(
+            "Review Cycles",
+            str(state.dual_qa_iterations),
+        )
+
+    summary_table.add_row("Total Run Cost", f"${total_cost:.4f}")
+    summary_table.add_row("Total Time",     _fmt_s(state.t_total))
+    if state.post_url:
+        summary_table.add_row("Published URL", state.post_url)
+
+    console.print(Panel(
+        summary_table,
+        title="[bold green]FINAL SUMMARY[/bold green]",
+        expand=False,
+    ))
+    console.print()
 
 
 # ── Validate sub-commands ─────────────────────────────────────────────────────
@@ -1174,6 +2449,9 @@ def validate_claude(
     try:
         with console.status("[bold blue]Generating article...", spinner="dots"):
             article = article_agent.generate(request=request, tenant=tenant)
+    except ArticleValidationError as exc:
+        console.print(f"[red]✗ Validation error:[/red] {exc}")
+        raise typer.Exit(code=1)
     except ClaudeAPIError as exc:
         console.print(f"[red]✗ Claude API error:[/red] {exc}")
         raise typer.Exit(code=1)
@@ -1227,9 +2505,9 @@ def validate_claude(
 def validate_wordpress(
     client_id: str = typer.Option(..., "--client-id"),
     website_id: str = typer.Option(..., "--website-id"),
-    input: Path | None = typer.Option(None, "--input", "-i", help="Existing article.json to test with (optional)."),
+    input: Path | None = typer.Option(None, "--input", "-i", help="article.json to use for taxonomy dry-run (optional)."),
 ) -> None:
-    """Validate WordPress: authenticate, check taxonomy, dry-run. Does not publish."""
+    """Validate WordPress: REST API, credentials, plugins. Optionally dry-run an article."""
     try:
         creds = CredentialStore(settings.credentials_dir).load(client_id, website_id)
     except CredentialNotFoundError as exc:
@@ -1239,7 +2517,13 @@ def validate_wordpress(
         console.print(f"[red]✗ Invalid credentials:[/red] {exc}")
         raise typer.Exit(code=1)
 
-    if input is not None:
+    with WordPressService(creds) as wp:
+        with console.status("[bold blue]Validating site...", spinner="dots"):
+            result = wp.validate_site()
+
+    _display_site_validation(result, creds.url)
+
+    if input is not None and result.rest_api_reachable and result.auth_ok:
         if not input.exists():
             console.print(f"[red]✗ File not found:[/red] {input}")
             raise typer.Exit(code=1)
@@ -1248,45 +2532,14 @@ def validate_wordpress(
         except Exception as exc:
             console.print(f"[red]✗ Cannot parse article.json:[/red] {exc}")
             raise typer.Exit(code=1)
-        console.print(f"[dim]Using article:[/dim] {article.title}\n")
-    else:
-        article = Article(
-            title="[SEO Agent] WordPress Validation Test",
-            content_markdown=(
-                "## Acerca de esta prueba\n\n"
-                "Este es un artículo sintético generado por `seo-agent validate wordpress`.\n"
-                "Se usa únicamente para verificar la conectividad y los permisos de WordPress.\n"
-                "**No se publicará.**\n\n"
-                + ("Párrafo de prueba. " * 30 + "\n\n") * 6
-            ),
-            tenant=TenantContext(client_id=client_id, website_id=website_id),
-            request=ArticleRequest(
-                topic="WordPress connection validation",
-                language=ArticleLanguage.ES,
-            ),
-            seo=SEOMetadata(
-                seo_title="SEO Agent — WordPress Validation Test",
-                meta_description="Artículo sintético para validar la integración con WordPress antes de producción.",
-                slug="seo-agent-validate-wordpress",
-                focus_keyword="seo agent validación",
-                suggested_category="Blog",
-                suggested_tags=["test", "seo-agent"],
-            ),
-            model_name="validate",
-        )
-        console.print("[dim]Sin --input: usando artículo sintético (no se publicará).[/dim]\n")
+        console.print(f"\n[dim]Running taxonomy dry-run for:[/dim] {article.title}")
+        with WordPressService(creds) as wp2:
+            agent = PublisherAgent(wp2)
+            with console.status("[bold blue]Running dry-run...", spinner="dots"):
+                report = agent.dry_run(article)
+        _display_dry_run(article, report, min_score=0)
 
-    with WordPressService(creds) as wp:
-        agent = PublisherAgent(wp)
-        with console.status("[bold blue]Conectando a WordPress...", spinner="dots"):
-            report = agent.dry_run(article)
-
-    _display_dry_run(article, report, min_score=0)
-
-    if report.connection_ok and report.auth_ok:
-        console.print("\n[green]✓ WordPress validado correctamente.[/green]")
-    else:
-        console.print("\n[red]✗ Fallo en la conexión o autenticación de WordPress.[/red]")
+    if not result.ready:
         raise typer.Exit(code=1)
 
 
@@ -1402,12 +2655,12 @@ def validate_images(
 
     t0 = time.perf_counter()
     try:
-        generator = OpenAIImageGenerator(settings.openai_api_key)
-        with console.status("[bold blue]Generating image via DALL-E 3...", spinner="dots"):
+        generator = OpenAIImageGenerator(settings.openai_api_key, budget=budget)
+        with console.status("[bold blue]Generating image via gpt-image-1...", spinner="dots"):
             asset = generator.generate(ImageGenerationRequest(
                 prompt=prompt,
                 alt_text="Validation test image",
-                size="1792x1024",
+                size="1536x1024",
             ))
     except Exception as exc:
         console.print(f"[red]✗ Image generation failed:[/red] {exc}")
@@ -1434,6 +2687,336 @@ def validate_images(
         table.add_row("Revised prompt", asset.source_detail[:100] + ("…" if len(asset.source_detail) > 100 else ""))
 
     console.print(Panel(table, title="[bold green]✓ Image Generation Validated[/bold green]", expand=False))
+
+
+@validate_app.command("edit-photo")
+def validate_edit_photo(
+    drive_file_id: str | None = typer.Option(
+        None, "--drive-file-id", "-d",
+        help="Google Drive file ID of a specific photo to edit. "
+             "Omit to auto-select a real company photograph from Drive.",
+    ),
+    image: Path | None = typer.Option(
+        None, "--image", "-i",
+        help="Local image file to edit (alternative to Drive).",
+    ),
+    edit: str = typer.Option(
+        ..., "--edit", "-e",
+        help="Minimal edit description sent verbatim to images.edit().",
+    ),
+    output_dir: Path = typer.Option(
+        Path("."), "--output-dir", "-o",
+        help="Directory to save original.jpg, edited.jpg, comparison.jpg.",
+    ),
+) -> None:
+    """
+    Test OpenAI images.edit() on a real company photograph with a minimal edit.
+
+    Source priority:
+      1. --image PATH         use a local file
+      2. --drive-file-id ID   use a specific Drive photo
+      3. (default)            auto-select a real company photograph from Drive
+
+    The auto-selection searches the connected Drive, filters out logos, screenshots,
+    and documents, and picks one genuine company photograph at random.
+
+    Saves three files to --output-dir:
+      original.jpg    — the unmodified source photo
+      edited.jpg      — the result from images.edit()
+      comparison.jpg  — side-by-side for visual evaluation (requires Pillow)
+
+    Examples:
+      python3 main.py validate edit-photo \\
+        --edit "Convert this exact photograph to nighttime. Preserve absolutely \\
+                everything except the sky, ambient lighting and shadows."
+
+      python3 main.py validate edit-photo \\
+        --drive-file-id 1ABC... \\
+        --edit "Remove the red sedan parked at the right edge of the driveway."
+    """
+    import io as _io
+    import base64 as _base64
+    import random as _random
+
+    # ── Validate prerequisites ─────────────────────────────────────────────────
+    if not settings.openai_api_key:
+        console.print("[red]✗ OPENAI_API_KEY not set.[/red]  Add it to .env: OPENAI_API_KEY=sk-...")
+        raise typer.Exit(code=1)
+
+    output_dir = output_dir if output_dir.is_absolute() else Path.cwd() / output_dir
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # ── Acquire source image ───────────────────────────────────────────────────
+    src_bytes: bytes
+    src_name: str
+
+    if image:
+        # Source 1: local file
+        if not image.exists():
+            console.print(f"[red]✗ File not found:[/red] {image}")
+            raise typer.Exit(code=1)
+        src_bytes = image.read_bytes()
+        src_name = image.name
+        console.print(f"[dim]Source:[/dim] {image}  ({len(src_bytes):,} bytes)")
+
+    else:
+        # Source 2 or 3: Drive (specific file ID or auto-select)
+        if not (settings.google_sa_json_path and settings.google_sa_json_path.exists()):
+            console.print(
+                "[red]✗ Google Drive not configured.[/red]\n"
+                "Set GOOGLE_SA_JSON_PATH in .env to use Drive photos.\n\n"
+                "Alternatively, pass a local file with --image PATH."
+            )
+            raise typer.Exit(code=1)
+
+        drive_svc = GoogleDriveService(settings.google_sa_json_path)
+
+        if drive_file_id:
+            # Source 2: specific file requested
+            console.print(f"[dim]Drive file ID:[/dim] {drive_file_id}")
+            try:
+                with console.status("[bold blue]Downloading from Google Drive...", spinner="dots"):
+                    src_bytes = drive_svc.download(drive_file_id)
+                src_name = f"{drive_file_id}.jpg"
+                console.print(f"[dim]Downloaded:[/dim] {len(src_bytes):,} bytes")
+            except Exception as exc:
+                console.print(f"[red]✗ Drive download failed:[/red] {exc}")
+                raise typer.Exit(code=1)
+
+        else:
+            # Source 3: auto-select from the Drive index
+            if not settings.drive_folder_id:
+                console.print(
+                    "[red]✗ DRIVE_FOLDER_ID not set.[/red]\n"
+                    "Add it to .env, or pass --drive-file-id or --image."
+                )
+                raise typer.Exit(code=1)
+
+            try:
+                with console.status("[bold blue]Loading Drive index...", spinner="dots"):
+                    index = DriveImageIndex(settings.drive_index_path)
+                    if index.needs_sync(settings.drive_folder_id, settings.drive_sync_max_age_hours):
+                        sync_stats = index.sync(drive_svc, settings.drive_folder_id)
+                        console.print(
+                            f"  [dim]Drive sync:[/dim] {sync_stats.images_found} images, "
+                            f"{sync_stats.folders_scanned} folders "
+                            f"({sync_stats.duration_seconds:.1f}s)"
+                        )
+                    all_candidates = index.list_all()
+            except Exception as exc:
+                console.print(f"[red]✗ Drive index failed:[/red] {exc}")
+                raise typer.Exit(code=1)
+
+            # Filter to genuine company photographs only.
+            # Exclude: logos, screenshots, documents, non-photo mime types.
+            _EXCLUDE_KEYWORDS = frozenset({
+                "logo", "logos", "screenshot", "screenshots", "icon", "icons",
+                "banner", "banners", "document", "documents", "doc", "flyer",
+                "flyers", "brochure", "brochures", "graphic", "graphics",
+                "template", "templates", "thumbnail", "thumbnails",
+            })
+            _PHOTO_MIME_TYPES = {"image/jpeg", "image/png", "image/heic", "image/heif", "image/webp"}
+
+            def _is_real_photo(f) -> bool:
+                if f.mime_type not in _PHOTO_MIME_TYPES:
+                    return False
+                combined = (f.name + " " + f.folder_path).lower()
+                return not any(kw in combined for kw in _EXCLUDE_KEYWORDS)
+
+            real_photos = [f for f in all_candidates if _is_real_photo(f)]
+
+            if not real_photos:
+                console.print(
+                    "[red]✗ No suitable company photographs found in Drive.[/red]\n"
+                    "Pass --drive-file-id or --image to specify one manually."
+                )
+                raise typer.Exit(code=1)
+
+            selected = _random.choice(real_photos)
+            console.print()
+            console.print(f"[bold]Selected Drive photo:[/bold]")
+            console.print(f"  {selected.name}")
+            console.print()
+            console.print(f"[bold]Drive File ID:[/bold]")
+            console.print(f"  {selected.file_id}")
+            console.print()
+
+            try:
+                with console.status("[bold blue]Downloading from Google Drive...", spinner="dots"):
+                    src_bytes = drive_svc.download(selected.file_id)
+                src_name = selected.name
+                drive_file_id = selected.file_id
+                folder = selected.folder_path.strip("/")
+                drive_path = f"{folder}/{selected.name}" if folder else selected.name
+                console.print(f"  [dim]Path:[/dim] {drive_path}")
+                console.print(f"  [dim]Size:[/dim] {len(src_bytes):,} bytes")
+            except Exception as exc:
+                console.print(f"[red]✗ Drive download failed:[/red] {exc}")
+                raise typer.Exit(code=1)
+
+    # Save original
+    original_path = output_dir / "original.jpg"
+    original_path.write_bytes(src_bytes)
+
+    # ── Prepare image for images.edit() ───────────────────────────────────────
+    # Always use an explicit (filename, bytes, content_type) 3-tuple.
+    # Raw bytes → application/octet-stream (rejected by API).
+    # BytesIO with .name is unreliable — BytesIO does not officially support .name.
+    from services.image_generators.openai_generator import _detect_content_type, _as_file_tuple
+
+    try:
+        from PIL import Image as _PILImage
+        pil_img = _PILImage.open(_io.BytesIO(src_bytes))
+        original_wh = pil_img.size
+        # Resize to ≤1536×1024 if needed to stay within API limits.
+        max_w, max_h = 1536, 1024
+        if pil_img.width > max_w or pil_img.height > max_h:
+            pil_img.thumbnail((max_w, max_h), _PILImage.LANCZOS)
+            resized_bytes_buf = _io.BytesIO()
+            pil_img.save(resized_bytes_buf, format="PNG")
+            upload_bytes = resized_bytes_buf.getvalue()
+        else:
+            upload_bytes = src_bytes
+        resized_wh = pil_img.size
+        pil_available = True
+    except ImportError:
+        upload_bytes = src_bytes
+        original_wh = ("?", "?")
+        resized_wh = ("?", "?")
+        pil_available = False
+
+    # Detect MIME type from actual bytes (never trust extension alone).
+    detected_mime, detected_ext = _detect_content_type(upload_bytes)
+    upload_filename = (
+        Path(src_name).stem + detected_ext if src_name else f"photo{detected_ext}"
+    )
+    # Explicit 3-tuple guarantees the correct Content-Type header.
+    edit_tuple = _as_file_tuple(upload_bytes, upload_filename)
+
+    # ── Build full prompt (preservation prefix + user edit) ───────────────────
+    from agents.image_resolver_agent import ImageResolverAgent as _IRA
+    full_prompt = _IRA._PRESERVATION_PROMPT_PREFIX + edit
+
+    # ── Print what we're sending ───────────────────────────────────────────────
+    console.print()
+    console.print(Panel(
+        f"[dim]{_IRA._PRESERVATION_PROMPT_PREFIX}[/dim][bold]{edit}[/bold]",
+        title="[dim]Full prompt sent to images.edit()[/dim]",
+        border_style="dim",
+        expand=False,
+    ))
+    console.print(
+        f"  [dim]Original size:[/dim] {original_wh[0]}×{original_wh[1]}"
+        + (f"  →  [dim]Sent:[/dim] {resized_wh[0]}×{resized_wh[1]}" if pil_available and resized_wh != original_wh else "")
+    )
+    console.print(
+        f"  [dim]Upload filename:[/dim] {upload_filename}  "
+        f"[dim]Content-Type:[/dim] {detected_mime}  "
+        f"[dim]Model:[/dim] gpt-image-1  [dim]Quality:[/dim] high"
+    )
+    console.print()
+
+    # ── Call images.edit() ─────────────────────────────────────────────────────
+    import openai as _openai
+    _client = _openai.OpenAI(api_key=settings.openai_api_key)
+
+    _INPUT_PER_M = 2.50   # gpt-image-1 approximate text token rate
+    _OUTPUT_PER_M = 10.00
+
+    t0 = time.perf_counter()
+    try:
+        with console.status("[bold blue]Calling images.edit()...", spinner="dots"):
+            response = _client.images.edit(
+                image=edit_tuple,       # (filename, bytes, content_type) — never octet-stream
+                prompt=full_prompt,
+                model="gpt-image-1",
+                size="1536x1024",
+                quality="high",
+                n=1,
+            )
+    except Exception as exc:
+        console.print(f"[red]✗ images.edit() failed:[/red] {exc}")
+        raise typer.Exit(code=1)
+
+    elapsed = time.perf_counter() - t0
+
+    # ── Decode result ──────────────────────────────────────────────────────────
+    result_b64 = response.data[0].b64_json
+    if not result_b64:
+        console.print("[red]✗ No image data in response[/red]")
+        raise typer.Exit(code=1)
+
+    edited_bytes = _base64.b64decode(result_b64)
+
+    # ── Compute cost ───────────────────────────────────────────────────────────
+    usage = getattr(response, "usage", None)
+    input_tokens = getattr(usage, "input_tokens", 0) if usage else 0
+    output_tokens = getattr(usage, "output_tokens", 0) if usage else 0
+    total_tokens = getattr(usage, "total_tokens", input_tokens + output_tokens) if usage else 0
+    cost_usd = round(
+        input_tokens * _INPUT_PER_M / 1_000_000
+        + output_tokens * _OUTPUT_PER_M / 1_000_000,
+        6,
+    )
+
+    # ── Save outputs ───────────────────────────────────────────────────────────
+    edited_path = output_dir / "edited.jpg"
+    edited_path.write_bytes(edited_bytes)
+
+    comparison_path = output_dir / "comparison.jpg"
+    if pil_available:
+        try:
+            orig_pil = _PILImage.open(original_path).convert("RGB")
+            edit_pil = _PILImage.open(_io.BytesIO(edited_bytes)).convert("RGB")
+            # Resize both to 768×512 for side-by-side
+            thumb_w, thumb_h = 768, 512
+            orig_thumb = orig_pil.resize((thumb_w, thumb_h), _PILImage.LANCZOS)
+            edit_thumb = edit_pil.resize((thumb_w, thumb_h), _PILImage.LANCZOS)
+            comparison = _PILImage.new("RGB", (thumb_w * 2 + 12, thumb_h + 40), (30, 30, 30))
+            comparison.paste(orig_thumb, (0, 40))
+            comparison.paste(edit_thumb, (thumb_w + 12, 40))
+            # Add simple text labels via PIL ImageDraw
+            from PIL import ImageDraw, ImageFont
+            draw = ImageDraw.Draw(comparison)
+            try:
+                font = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", 20)
+            except Exception:
+                font = ImageFont.load_default()
+            draw.text((10, 10), "ORIGINAL", fill=(200, 200, 200), font=font)
+            draw.text((thumb_w + 22, 10), "EDITED", fill=(200, 200, 200), font=font)
+            comparison.save(comparison_path, "JPEG", quality=92)
+        except Exception as exc:
+            console.print(f"[yellow]Warning:[/yellow] comparison.jpg not generated: {exc}")
+            comparison_path = None
+    else:
+        comparison_path = None
+
+    # ── Report ─────────────────────────────────────────────────────────────────
+    table = Table(show_header=False, box=box.SIMPLE, padding=(0, 1))
+    table.add_column("Field", style="dim", min_width=20)
+    table.add_column("Value", overflow="fold")
+    table.add_row("Status", "[green]✓ Edit complete[/green]")
+    table.add_row("Time", f"{elapsed:.1f}s")
+    table.add_row("Original", str(original_path))
+    table.add_row("Edited", str(edited_path))
+    if comparison_path:
+        table.add_row("Comparison", str(comparison_path))
+    table.add_row("Edited size", f"{len(edited_bytes):,} bytes")
+    table.add_row("Input tokens", str(input_tokens))
+    table.add_row("Output tokens", str(output_tokens))
+    table.add_row("Total tokens", str(total_tokens))
+    table.add_row("Estimated cost", f"${cost_usd:.6f} USD" if cost_usd else "n/a (usage not returned)")
+
+    console.print(Panel(
+        table,
+        title="[bold green]✓ images.edit() Validated[/bold green]",
+        expand=False,
+    ))
+
+    console.print(
+        "\n[dim]Open the comparison to evaluate identity preservation:[/dim]\n"
+        f"  open {comparison_path or edited_path}"
+    )
 
 
 # ── Topic suggestion helper ───────────────────────────────────────────────────
@@ -1464,7 +3047,8 @@ def _suggest_topics(
             try:
                 data = __import__("json").loads(article_file.read_text(encoding="utf-8"))
                 title = data.get("title") or data.get("seo", {}).get("meta_title") or ""
-                if title:
+                pub_status = data.get("publishing", {}).get("status", "")
+                if title and pub_status == "publish":
                     existing_titles.append(title)
             except Exception:
                 pass
@@ -1501,7 +3085,13 @@ def _suggest_topics(
         "Write ideas whose relevance does not expire."
     )
 
-    raw = claude.generate(system, [{"role": "user", "content": "\n".join(context_lines)}], thinking=False)
+    raw = claude.generate(
+        system,
+        [{"role": "user", "content": "\n".join(context_lines)}],
+        thinking=False,
+        model=settings.topic_model,
+        label="topics:suggest",
+    )
     return re.findall(r'^\d+\.\s+(.+)$', raw.strip(), flags=re.MULTILINE)
 
 
@@ -1626,9 +3216,9 @@ def _display_autopublish_summary(
 
     img_parts: list[str] = []
     if state.img_from_drive:
-        img_parts.append(f"{state.img_from_drive} from Drive")
-    if state.img_from_openai:
-        img_parts.append(f"{state.img_from_openai} from OpenAI")
+        img_parts.append(f"{state.img_from_drive} Drive original")
+    if state.img_from_edited:
+        img_parts.append(f"{state.img_from_edited} preservation edit")
     if not img_parts:
         img_parts.append("none")
     lines.append(f"[bold]Images[/bold]    {', '.join(img_parts)}")
@@ -1657,7 +3247,7 @@ def autopublish(
     city: str | None = typer.Option(None, "--city", help="Target city for local SEO."),
     state_opt: str | None = typer.Option(None, "--state", help="Target state (required with --city)."),
     keyword: str | None = typer.Option(None, "--keyword", "-k", help="Primary keyword hint for generation."),
-    words: int = typer.Option(settings.default_word_count, "--words", "-w", min=300, max=10000, help="Target word count."),
+    words: int = typer.Option(settings.default_word_count, "--words", "-w", min=300, max=1000, help="Target word count (700–1000; default 850)."),
     language: ArticleLanguage = typer.Option(ArticleLanguage.EN, "--language", "-l", help="Article language (always English)."),
     status: str = typer.Option("draft", "--status", help="WordPress post status: draft or publish."),
     min_score: int = typer.Option(settings.seo_qa_min_score, "--min-score", min=0, max=100, help="Minimum SEO quality score."),
@@ -1665,6 +3255,7 @@ def autopublish(
     no_links: bool = typer.Option(False, "--no-links", help="Skip internal link enrichment."),
     output: Path | None = typer.Option(None, "--output", "-o", help="Output directory (overrides OUTPUT_DIR in .env)."),
     suggest_n: int = typer.Option(10, "--suggest-n", help="How many topic ideas to generate before picking the first."),
+    dev: bool = typer.Option(False, "--dev", help="Dev mode: generate only. Skips QA, images, links, and WordPress."),
 ) -> None:
     """Full auto-pilot: suggest a topic → generate article → publish to WordPress."""
 
@@ -1687,6 +3278,35 @@ def autopublish(
     tenant = TenantContext(client_id=resolved_client, website_id=resolved_website)
     location = Location(city=city, state=state_opt) if city and state_opt else None
 
+    # ── Pre-flight: credentials + city/state ──────────────────────
+    website_url: str | None = None
+    try:
+        _creds = CredentialStore(settings.credentials_dir).load(resolved_client, resolved_website)
+        website_url = _creds.url
+    except Exception as _creds_exc:
+        console.print(
+            f"[red]Pre-flight failed:[/red] No credentials found for "
+            f"{resolved_client}/{resolved_website}. "
+            "Run [bold]seo-agent import-sites[/bold] first."
+        )
+        raise typer.Exit(code=1)
+
+    # Warn (don't fail) if city/state cannot be resolved — resolver will try WP/heuristics
+    _profile_city: str | None = None
+    try:
+        from models.site_profile import SiteProfile as _SP
+        _profile_path = settings.profiles_dir / resolved_client / f"{resolved_website}.json"
+        if _profile_path.exists():
+            _sp = _SP.model_validate_json(_profile_path.read_text(encoding="utf-8"))
+            _profile_city = _sp.city or None
+    except Exception:
+        pass
+    if not city and not _profile_city:
+        console.print(
+            "[yellow]Warning:[/yellow] No city/state in profile or --city flag. "
+            "BusinessContextResolver will attempt to detect from WordPress."
+        )
+
     console.print()
     console.print(Panel(
         f"[bold]SEO Agent — Auto Publish[/bold]\n"
@@ -1694,6 +3314,10 @@ def autopublish(
         expand=False,
     ))
     console.print()
+
+    # ── Start call tracer for this run ────────────────────────────
+    import services.call_tracer as _call_tracer
+    _call_tracer.start()
 
     # ── Step 1: Suggest topics ────────────────────────────────────
     with console.status(f"[bold green]Generating {suggest_n} topic ideas...", spinner="dots"):
@@ -1728,10 +3352,26 @@ def autopublish(
         tone=settings.default_tone,
         language=language,
         focus_keyword=keyword,
+        website_url=website_url,
+    )
+    request = BusinessContextResolver(settings.profiles_dir).resolve(
+        resolved_client, resolved_website, request
     )
 
     article_path = _execute_generation(request, tenant, base_dir)
     article = Article.model_validate_json(article_path.read_text(encoding="utf-8"))
+    _save_last_article(article)
+
+    if dev:
+        console.print(
+            "[yellow]Dev mode:[/yellow] QA, images, links, and WordPress skipped. "
+            "Article saved locally."
+        )
+        console.print(f"[dim]Saved:[/dim] {article_path}")
+        _tracer = _call_tracer.get()
+        if _tracer and _tracer.records:
+            console.print(_tracer.summary())
+        return
 
     # ── Steps 3–6: SEO QA + Image resolution + Publish ───────────
     updated, state = _run_publish_flow(
@@ -1745,6 +3385,399 @@ def autopublish(
 
     # ── Summary ───────────────────────────────────────────────────
     _display_autopublish_summary(selected_topic, article, updated, state)
+
+    # ── LLM call cost profile ──────────────────────────────────────
+    _tracer = _call_tracer.get()
+    if _tracer and _tracer.records:
+        console.print(_tracer.summary())
+
+
+@app.command()
+def republish(
+    status: str = typer.Option("draft", "--status", help="WordPress post status: draft or publish."),
+    no_links: bool = typer.Option(False, "--no-links", help="Skip internal link enrichment."),
+    post_id: int | None = typer.Option(None, "--post-id", help="Update an existing WordPress post by ID instead of creating a new one."),
+) -> None:
+    """Republish the last generated article without re-running generation, QA, or image resolution."""
+
+    if not _LAST_ARTICLE_PATH.exists():
+        console.print(
+            "[red]Error:[/red] No saved article found. "
+            f"Run [bold]autopublish[/bold] first (expected at {_LAST_ARTICLE_PATH})."
+        )
+        raise typer.Exit(code=1)
+
+    try:
+        article = Article.model_validate_json(
+            _LAST_ARTICLE_PATH.read_text(encoding="utf-8")
+        )
+    except Exception as exc:
+        console.print(f"[red]Error:[/red] Could not parse {_LAST_ARTICLE_PATH}: {exc}")
+        raise typer.Exit(code=1)
+
+    # Strip image_plans so the mandatory-image gate in PublisherAgent does not
+    # block republish — images were resolved (or skipped) in the original run.
+    article = article.model_copy(update={"image_plans": []})
+
+    console.print()
+    console.print(Panel(
+        f"[bold]SEO Agent — Republish[/bold]\n"
+        f"[dim]{article.tenant.client_id} / {article.tenant.website_id}[/dim]\n"
+        f"[dim]{article.title}[/dim]",
+        expand=False,
+    ))
+    console.print()
+
+    import services.call_tracer as _call_tracer
+    _call_tracer.start()
+
+    _run_publish_flow(
+        _LAST_ARTICLE_PATH,
+        article,
+        status=status,
+        no_image=True,
+        no_links=no_links,
+        no_qa=True,
+        post_id=post_id,
+        show_pipeline_report=True,
+    )
+
+    _tracer = _call_tracer.get()
+    if _tracer and _tracer.records:
+        console.print(_tracer.summary())
+
+
+_TENANT_ID_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
+
+
+# ── Bulk import helpers ───────────────────────────────────────────────────────
+
+def _load_import_rows(path: Path) -> list[dict[str, str]]:
+    """Read a .csv or .xlsx file and return rows as dicts with stripped string values."""
+    suffix = path.suffix.lower()
+    if suffix == ".csv":
+        with path.open(encoding="utf-8-sig") as f:
+            reader = csv.DictReader(f)
+            return [{k.strip(): (v or "").strip() for k, v in row.items()} for row in reader]
+    if suffix in (".xlsx", ".xls"):
+        try:
+            import openpyxl
+        except ImportError as exc:
+            raise ImportError(
+                "openpyxl is required to read .xlsx files. "
+                "Install it:  pip install openpyxl"
+            ) from exc
+        wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+        ws = wb.active
+        raw_rows = list(ws.iter_rows(values_only=True))
+        wb.close()
+        if not raw_rows:
+            return []
+        headers = [str(h).strip() if h is not None else "" for h in raw_rows[0]]
+        result = []
+        for row in raw_rows[1:]:
+            if all(v is None for v in row):
+                continue
+            result.append({
+                headers[i]: str(row[i]).strip() if row[i] is not None else ""
+                for i in range(len(headers))
+            })
+        return result
+    raise ValueError(f"Unsupported file type '{path.suffix}'. Use .csv or .xlsx")
+
+
+@dataclass
+class _ImportResult:
+    client_id: str
+    website_id: str
+    company_name: str
+    url: str
+    outcome: str  # READY | READY_WITH_WARNINGS | FAILED | SKIPPED | SKIPPED_EXISTS | INVALID
+    errors: list[str] = _dc_field(default_factory=list)
+
+
+def _display_import_report(results: list[_ImportResult]) -> None:
+    counts: dict[str, int] = {}
+    for r in results:
+        counts[r.outcome] = counts.get(r.outcome, 0) + 1
+
+    created = counts.get("READY", 0) + counts.get("READY_WITH_WARNINGS", 0) + counts.get("FAILED", 0)
+
+    lines = [
+        f"[bold]IMPORT SUMMARY[/bold]",
+        "",
+        f"{len(results)} rows processed",
+        f"Credential files created: {created}",
+        "",
+        f"[green]READY:[/green]                  {counts.get('READY', 0)}",
+        f"[yellow]READY_WITH_WARNINGS:[/yellow]    {counts.get('READY_WITH_WARNINGS', 0)}",
+        f"[red]FAILED:[/red]                 {counts.get('FAILED', 0)}",
+    ]
+    if counts.get("SKIPPED"):
+        lines.append(f"[dim]SKIPPED (not Pending):[/dim]   {counts['SKIPPED']}")
+    if counts.get("SKIPPED_EXISTS"):
+        lines.append(f"[dim]SKIPPED (already exists):[/dim] {counts['SKIPPED_EXISTS']}")
+    if counts.get("INVALID"):
+        lines.append(f"[red]INVALID (bad row):[/red]      {counts['INVALID']}")
+
+    console.print()
+    console.print(Panel("\n".join(lines), title="[bold]Bulk Import — Complete[/bold]", expand=False))
+
+    attention = [r for r in results if r.outcome not in ("READY", "SKIPPED")]
+    if attention:
+        table = Table(show_header=True, box=box.SIMPLE, padding=(0, 1))
+        table.add_column("Site", style="bold", min_width=28)
+        table.add_column("Status", min_width=22)
+        table.add_column("Issues", overflow="fold")
+
+        _outcome_color = {
+            "READY_WITH_WARNINGS": "yellow",
+            "FAILED": "red",
+            "SKIPPED_EXISTS": "dim",
+            "INVALID": "red",
+        }
+        for r in attention:
+            color = _outcome_color.get(r.outcome, "dim")
+            name = f"{r.client_id}/{r.website_id}"
+            if r.company_name:
+                name += f"\n[dim]{r.company_name}[/dim]"
+            table.add_row(name, f"[{color}]{r.outcome}[/{color}]", "\n".join(r.errors))
+
+        console.print(Panel(table, title="[bold]Sites Requiring Attention[/bold]", expand=False))
+
+
+@app.command("import-sites")
+def import_sites(
+    file: Path = typer.Argument(..., help="Path to .xlsx or .csv spreadsheet."),
+    overwrite: bool = typer.Option(False, "--overwrite", help="Overwrite existing credential files."),
+) -> None:
+    """Bulk onboard multiple WordPress sites from a spreadsheet."""
+    if not file.exists():
+        console.print(f"[red]✗ File not found:[/red] {file}")
+        raise typer.Exit(code=1)
+
+    try:
+        rows = _load_import_rows(file)
+    except ImportError as exc:
+        console.print(f"[red]✗[/red] {exc}")
+        raise typer.Exit(code=1)
+    except ValueError as exc:
+        console.print(f"[red]✗[/red] {exc}")
+        raise typer.Exit(code=1)
+
+    if not rows:
+        console.print("[yellow]Warning:[/yellow] No data rows found in file.")
+        return
+
+    console.print()
+    console.print(Panel(
+        f"[bold]SEO Agent — Bulk Site Import[/bold]\n"
+        f"[dim]{file.name}  ·  {len(rows)} row{'s' if len(rows) != 1 else ''}[/dim]",
+        expand=False,
+    ))
+    console.print()
+
+    _REQUIRED = {"client_id", "website_id", "website_url", "wp_username", "app_password"}
+    store = CredentialStore(settings.credentials_dir)
+    profile_svc = SiteProfileService(settings.profiles_dir)
+    results: list[_ImportResult] = []
+
+    for i, row in enumerate(rows, 1):
+        client_id = row.get("client_id", "").strip()
+        website_id = row.get("website_id", "").strip()
+        company_name = row.get("company_name", "").strip()
+        url = row.get("website_url", "").strip().rstrip("/")
+        wp_user = row.get("wp_username", "").strip()
+        app_password_val = row.get("app_password", "").strip()
+        default_cat_raw = row.get("default_category_id", "").strip()
+        onboarding_status = row.get("onboarding_status", "Pending").strip()
+        city = row.get("city", "").strip()
+        state = row.get("state", "").strip()
+
+        label = company_name or client_id or f"row {i}"
+
+        # Validate required fields
+        missing = sorted(f for f in _REQUIRED if not row.get(f, "").strip())
+        if missing:
+            results.append(_ImportResult(
+                client_id=client_id or f"row_{i}",
+                website_id=website_id or "?",
+                company_name=company_name,
+                url=url,
+                outcome="INVALID",
+                errors=[f"Missing required fields: {', '.join(missing)}"],
+            ))
+            console.print(f"[dim]Row {i:2d}[/dim]  [red]INVALID[/red]         {label}")
+            continue
+
+        # Skip non-Pending rows unless --overwrite (which re-syncs all existing sites)
+        if not overwrite and onboarding_status.lower() != "pending":
+            results.append(_ImportResult(
+                client_id=client_id,
+                website_id=website_id,
+                company_name=company_name,
+                url=url,
+                outcome="SKIPPED",
+                errors=[f"onboarding_status is '{onboarding_status}' (expected 'Pending')"],
+            ))
+            console.print(f"[dim]Row {i:2d}[/dim]  [dim]SKIPPED[/dim]         {label}")
+            continue
+
+        # Skip if credentials already exist and not overwriting
+        if store.exists(client_id, website_id) and not overwrite:
+            results.append(_ImportResult(
+                client_id=client_id,
+                website_id=website_id,
+                company_name=company_name,
+                url=url,
+                outcome="SKIPPED_EXISTS",
+                errors=["Credentials already exist. Use --overwrite to replace."],
+            ))
+            console.print(f"[dim]Row {i:2d}[/dim]  [yellow]SKIPPED_EXISTS[/yellow]  {label}")
+            continue
+
+        # Save credentials (WordPress auth only)
+        default_category_id: int | None = None
+        if default_cat_raw:
+            try:
+                default_category_id = int(default_cat_raw)
+            except ValueError:
+                pass
+
+        creds = WordPressCredentials(
+            url=url,
+            user=wp_user,
+            app_password=app_password_val,
+            default_category_id=default_category_id,
+        )
+        store.save(client_id, website_id, creds)
+
+        # Update or create site profile with city/state from CSV
+        if city and state:
+            existing_profile = profile_svc.load(client_id, website_id)
+            if existing_profile:
+                profile_svc.save(existing_profile.model_copy(update={"city": city, "state": state}))
+            else:
+                profile_svc.save(SiteProfile(
+                    client_id=client_id,
+                    website_id=website_id,
+                    business_name=company_name or website_id,
+                    niche="",
+                    primary_service="",
+                    city=city,
+                    state=state,
+                ))
+
+        # Validate site using shared architecture
+        with console.status(f"[bold blue]Validating {label}...", spinner="dots"):
+            with WordPressService(creds) as wp:
+                site_result = wp.validate_site()
+
+        results.append(_ImportResult(
+            client_id=client_id,
+            website_id=website_id,
+            company_name=company_name,
+            url=url,
+            outcome=site_result.status,
+            errors=site_result.errors,
+        ))
+        _status_color = {"READY": "green", "READY_WITH_WARNINGS": "yellow", "FAILED": "red"}
+        sc = _status_color[site_result.status]
+        console.print(f"[dim]Row {i:2d}[/dim]  [{sc}]{site_result.status:22}[/{sc}]  {label}")
+
+    _display_import_report(results)
+
+    if any(r.outcome == "FAILED" for r in results):
+        raise typer.Exit(code=1)
+
+
+@app.command("onboard-site")
+def onboard_site(
+    force: bool = typer.Option(False, "--force", help="Overwrite existing credentials."),
+) -> None:
+    """Guided setup: collect credentials, validate the site, and save to the credential store."""
+    console.print()
+    console.print(Panel(
+        "[bold]SEO Agent — Onboard New Site[/bold]\n"
+        "[dim]Credentials are stored locally. No code changes required.[/dim]",
+        expand=False,
+    ))
+    console.print()
+
+    # ── Phase 1: Collect ──────────────────────────────────────────────────────
+
+    while True:
+        client_id = typer.prompt("Client ID (e.g. ACME)").strip()
+        if _TENANT_ID_RE.match(client_id):
+            break
+        console.print("[red]Error:[/red] Client ID may only contain letters, digits, underscores, and hyphens.")
+
+    while True:
+        website_id = typer.prompt("Website ID (e.g. acme-chicago)").strip()
+        if _TENANT_ID_RE.match(website_id):
+            break
+        console.print("[red]Error:[/red] Website ID may only contain letters, digits, underscores, and hyphens.")
+
+    site_url = typer.prompt("WordPress site URL (e.g. https://example.com)").strip().rstrip("/")
+    wp_user = typer.prompt("WordPress username").strip()
+    app_password = typer.prompt("Application Password", hide_input=True).strip()
+
+    # ── Phase 2: Validate (pre-save) ─────────────────────────────────────────
+
+    store = CredentialStore(settings.credentials_dir)
+    if store.exists(client_id, website_id) and not force:
+        console.print(
+            f"\n[yellow]Warning:[/yellow] Credentials already exist for "
+            f"[bold]{client_id}/{website_id}[/bold].\n"
+            "Use [bold]--force[/bold] to overwrite."
+        )
+        raise typer.Exit(code=1)
+
+    # ── Phase 3: Save ─────────────────────────────────────────────────────────
+
+    creds = WordPressCredentials(url=site_url, user=wp_user, app_password=app_password)
+    saved_path = store.save(client_id, website_id, creds)
+    console.print(f"\n[green]✓[/green] Credentials saved: [dim]{saved_path}[/dim]")
+
+    # ── Phase 4: validate_site ────────────────────────────────────────────────
+
+    console.print()
+    with WordPressService(creds) as wp:
+        with console.status("[bold blue]Validating site...", spinner="dots"):
+            result = wp.validate_site()
+
+    _display_site_validation(result, site_url)
+
+    # ── Phase 5: Summary ──────────────────────────────────────────────────────
+
+    console.print()
+    if result.status == "READY":
+        console.print(Panel(
+            f"[green]Site is ready.[/green] Run your first article:\n\n"
+            f"  [bold]seo-agent autopublish --client-id {client_id} --website-id {website_id}[/bold]",
+            title="[bold green]✓ Onboarding Complete[/bold green]",
+            expand=False,
+        ))
+    elif result.status == "READY_WITH_WARNINGS":
+        warnings = "\n".join(f"  • {e}" for e in result.errors)
+        console.print(Panel(
+            f"[yellow]Site is functional but has warnings:[/yellow]\n\n{warnings}\n\n"
+            f"Fix the above issues, then run:\n"
+            f"  [bold]seo-agent validate wordpress --client-id {client_id} --website-id {website_id}[/bold]",
+            title="[bold yellow]⚠ Onboarding Complete — Warnings[/bold yellow]",
+            expand=False,
+        ))
+    else:
+        issues = "\n".join(f"  • {e}" for e in result.errors)
+        console.print(Panel(
+            f"[red]Site validation failed:[/red]\n\n{issues}\n\n"
+            f"Fix the above issues, then re-run onboard-site or validate:\n"
+            f"  [bold]seo-agent validate wordpress --client-id {client_id} --website-id {website_id}[/bold]\n\n"
+            f"[dim]Credentials are saved at {saved_path} — edit or delete to retry.[/dim]",
+            title="[bold red]✗ Onboarding Incomplete — Action Required[/bold red]",
+            expand=False,
+        ))
+        raise typer.Exit(code=1)
 
 
 if __name__ == "__main__":

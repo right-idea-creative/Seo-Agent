@@ -1,0 +1,78 @@
+{
+  "version": "1.0.0",
+  "description": "Structural template for local-service SEO buyer-guide articles",
+  "canonical_source": "output/articles/RIMC/overheaddoorgnv/choose-reliable-overhead-door-service-gainesville-fl/article.md",
+
+  "_update_instructions": [
+    "To update this template: edit this file and restart the service. No code changes required.",
+    "Increment 'version' when making structural changes so the change is visible in logs.",
+    "All prompt text that appears in generation prompts is built programmatically from the fields below.",
+    "Only 'validation_rules' and 'repair_rules' are referenced in code by key name.",
+    "All other keys are for documentation and prompt construction."
+  ],
+
+  "document_skeleton": {
+    "intro": {
+      "has_heading": false,
+      "paragraph_count": "1-2",
+      "note": "Hook sentence names the core problem or misconception. No heading before this block."
+    },
+    "h2_sections": {
+      "min": 4,
+      "max": 7,
+      "element_sequence": [
+        "paragraph:1-3",
+        "list:optional — bullet or numbered, at least 3 items when present",
+        "callout:optional — only when there is a genuine safety or critical-decision note",
+        "paragraph:1-2",
+        "thesis_closer:required — one punchy closing sentence that stands alone"
+      ],
+      "image_after_positions": [1, 2, 4],
+      "image_position_note": "Place image placeholders AFTER sections 1, 2, and 4 (not before)."
+    },
+    "faq": {
+      "heading": "Frequently Asked Questions",
+      "question_format": "**Exact question text ending with a question mark?**",
+      "answer_format": "Answer paragraph. 2-4 sentences. Concrete, scannable.",
+      "count": "4-6",
+      "note": "FAQ is always the second-to-last block. Bold format for questions is mandatory."
+    },
+    "closing": {
+      "has_heading": false,
+      "note": "One paragraph after the FAQ. No heading. Editorial tone — reinforce the article's main argument and leave the reader with expert insight. Never open with 'Contact us', 'Call now', or any promotional CTA. Never introduce new city or neighborhood names not established earlier in the article."
+    }
+  },
+
+  "formatting": {
+    "callout_prefix": "> ⚠️ **Important:**",
+    "image_placeholder": "<!-- SEO_AGENT_IMAGE: {id} -->",
+    "faq_question_wrap": "**{question}**",
+    "bold_key_terms_in_body": true,
+    "allowed_list_styles": ["bullet", "numbered"],
+    "max_heading_depth": 2,
+    "no_bare_bold_as_heading": true,
+    "external_links": "markdown inline — [anchor text](url)"
+  },
+
+  "validation_rules": {
+    "h1_max": 1,
+    "h1_note": "Exactly 1 H1 expected in raw generated content. It is stripped before storage.",
+    "h2_min": 4,
+    "h2_max": 8,
+    "h3_max": 4,
+    "no_empty_headings": true,
+    "no_duplicate_headings": true,
+    "no_skipped_heading_levels": true,
+    "faq_heading_exact_match": "Frequently Asked Questions",
+    "faq_min_questions": 4,
+    "faq_max_questions": 7,
+    "image_placeholder_regex": "<!-- SEO_AGENT_IMAGE: [a-z][a-z0-9_-]* -->"
+  },
+
+  "repair_rules": {
+    "remove_empty_headings": true,
+    "deduplicate_headings": "keep_first",
+    "normalize_faq_question_bold": true,
+    "strip_trailing_whitespace": true
+  }
+}

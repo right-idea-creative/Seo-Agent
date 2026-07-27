@@ -1,4 +1,5 @@
 import logging
+from dataclasses import dataclass, field
 from typing import Any
 
 import httpx
@@ -22,6 +23,33 @@ class WordPressNotFoundError(WordPressError):
 
 class WordPressAPIError(WordPressError):
     """Raised on any other HTTP or connectivity error."""
+
+
+# ── Validation result ─────────────────────────────────────────────────────────
+
+@dataclass
+class SiteValidationResult:
+    """Encapsulates the outcome of WordPressService.validate_site()."""
+    rest_api_reachable: bool = False
+    auth_ok: bool = False
+    auth_user: str = ""
+    seo_plugin: SEOPlugin = SEOPlugin.NONE
+    agent_plugin_installed: bool = False
+    errors: list[str] = field(default_factory=list)
+
+    @property
+    def ready(self) -> bool:
+        """True when all required components are confirmed active."""
+        return self.rest_api_reachable and self.auth_ok and self.agent_plugin_installed
+
+    @property
+    def status(self) -> str:
+        """Single source of truth for site readiness: READY | READY_WITH_WARNINGS | FAILED."""
+        if not self.rest_api_reachable or not self.auth_ok:
+            return "FAILED"
+        if not self.agent_plugin_installed or self.seo_plugin == SEOPlugin.NONE:
+            return "READY_WITH_WARNINGS"
+        return "READY"
 
 
 # ── Service ───────────────────────────────────────────────────────────────────
@@ -48,7 +76,9 @@ class WordPressService:
         self._credentials = credentials
         self._base = credentials.url.rstrip("/") + self._API_PATH
         self._client = httpx.Client(
-            auth=(credentials.user, credentials.app_password), timeout=30
+            auth=(credentials.user, credentials.app_password),
+            timeout=30,
+            follow_redirects=True,  # handle HTTP → HTTPS redirects transparently
         )
 
     @property
@@ -113,6 +143,86 @@ class WordPressService:
             logger.warning("SEO plugin auto-detection failed: %s", exc)
         logger.info("No known SEO plugin detected — meta fields will not be sent.")
         return SEOPlugin.NONE
+
+    def validate_site(self) -> SiteValidationResult:
+        """
+        Run a complete site health check and return a structured result.
+
+        Checks REST API reachability, credential validity, SEO plugin presence,
+        and seo-agent.php plugin presence. Short-circuits on the first fatal
+        failure (unreachable or bad auth) so errors are unambiguous.
+        """
+        result = SiteValidationResult()
+
+        try:
+            self.check_connection()
+            result.rest_api_reachable = True
+        except Exception as exc:
+            result.errors.append(f"REST API unreachable: {exc}")
+            return result
+
+        try:
+            result.auth_user = self.check_auth()
+            result.auth_ok = True
+        except WordPressAuthError as exc:
+            result.errors.append(f"Authentication failed: {exc}")
+        except Exception as exc:
+            result.errors.append(f"Auth check error: {exc}")
+
+        namespaces = self._get_wp_namespaces()
+        if any(ns.startswith("yoast") for ns in namespaces):
+            result.seo_plugin = SEOPlugin.YOAST
+        elif any("rankmath" in ns for ns in namespaces):
+            result.seo_plugin = SEOPlugin.RANKMATH
+        result.agent_plugin_installed = self._check_agent_plugin()
+
+        if result.seo_plugin == SEOPlugin.NONE:
+            result.errors.append(
+                "No supported SEO plugin detected. Yoast or Rank Math is required."
+            )
+        if not result.agent_plugin_installed:
+            result.errors.append(
+                "seo-agent.php plugin not detected. "
+                "Required for idempotent publishing and Yoast meta writes."
+            )
+
+        return result
+
+    def _get_wp_namespaces(self) -> list[str]:
+        """Fetch /wp-json/ and return its namespace list."""
+        try:
+            root_url = self._credentials.url.rstrip("/") + "/wp-json/"
+            resp = self._client.get(root_url, timeout=10)
+            if resp.status_code == 200:
+                return resp.json().get("namespaces", [])
+        except Exception as exc:
+            logger.warning("Could not fetch WP-JSON root: %s", exc)
+        return []
+
+    def _check_agent_plugin(self) -> bool:
+        """
+        Detect seo-agent.php via the REST schema, not the namespace registry.
+
+        The plugin registers meta fields with register_post_meta(show_in_rest=True).
+        It never calls register_rest_route(), so it never appears in /wp-json/
+        namespaces. The correct signal is _seo_agent_id appearing in the
+        OPTIONS /wp-json/wp/v2/posts schema — a read-only, side-effect-free probe
+        that works even on empty sites.
+        """
+        try:
+            resp = self._client.options(self._base + "/posts", timeout=10)
+            if resp.status_code == 200:
+                meta_props = (
+                    resp.json()
+                    .get("schema", {})
+                    .get("properties", {})
+                    .get("meta", {})
+                    .get("properties", {})
+                )
+                return "_seo_agent_id" in meta_props
+        except Exception as exc:
+            logger.warning("Agent plugin schema probe failed: %s", exc)
+        return False
 
     # ── Taxonomy ──────────────────────────────────────────────────────────────
 
@@ -318,40 +428,96 @@ class WordPressService:
     # ── HTTP primitives ───────────────────────────────────────────────────────
 
     def _get(self, path: str, params: dict[str, Any] | None = None) -> Any:
+        url = self._base + path
         try:
-            resp = self._client.get(self._base + path, params=params)
+            resp = self._client.get(url, params=params)
+            logger.debug("GET %s → HTTP %d", url, resp.status_code)
             self._raise_for_status(resp)
-            return resp.json()
+            return self._parse_json(resp, "GET", url)
         except httpx.HTTPError as exc:
-            raise WordPressAPIError(f"Request failed: {exc}") from exc
+            raise WordPressAPIError(f"GET {url} failed: {exc}") from exc
 
     def _post(self, path: str, data: dict[str, Any]) -> dict[str, Any]:
+        url = self._base + path
         try:
-            resp = self._client.post(self._base + path, json=data)
+            resp = self._client.post(url, json=data)
+            logger.debug("POST %s → HTTP %d", url, resp.status_code)
+            logger.debug("POST response body: %s", resp.text[:500])
             self._raise_for_status(resp)
-            return resp.json()
+            result = self._parse_json(resp, "POST", url)
+            return result
         except httpx.HTTPError as exc:
-            raise WordPressAPIError(f"Request failed: {exc}") from exc
+            raise WordPressAPIError(f"POST {url} failed: {exc}") from exc
 
     def _patch(self, path: str, data: dict[str, Any]) -> dict[str, Any]:
+        url = self._base + path
         try:
-            resp = self._client.patch(self._base + path, json=data)
+            resp = self._client.patch(url, json=data)
+            logger.debug("PATCH %s → HTTP %d", url, resp.status_code)
             self._raise_for_status(resp)
-            return resp.json()
+            result = self._parse_json(resp, "PATCH", url)
+            return result
         except httpx.HTTPError as exc:
-            raise WordPressAPIError(f"Request failed: {exc}") from exc
+            raise WordPressAPIError(f"PATCH {url} failed: {exc}") from exc
 
-    def _raise_for_status(self, resp: httpx.Response) -> None:
-        if resp.status_code in (401, 403):
+    @staticmethod
+    def _parse_json(resp: "httpx.Response", method: str, url: str) -> Any:
+        """
+        Parse response body as JSON, raising WordPressAPIError on failure.
+
+        This prevents json.JSONDecodeError from propagating as an unhandled
+        exception when WordPress (or a proxy) returns HTML or an empty body
+        for a request that _raise_for_status passed silently.
+        """
+        try:
+            return resp.json()
+        except Exception as exc:
+            preview = resp.text[:200].replace("\n", " ")
+            raise WordPressAPIError(
+                f"{method} {url} returned HTTP {resp.status_code} "
+                f"but body is not valid JSON: {preview!r}"
+            ) from exc
+
+    def _raise_for_status(self, resp: "httpx.Response") -> None:
+        """
+        Raise the appropriate exception for any non-2xx response.
+
+        WordPress REST API always returns 2xx on success (typically 200 or 201).
+        Any other status — including 3xx redirects — is treated as an error.
+        3xx without follow_redirects=True means the client URL is wrong (HTTP
+        vs HTTPS mismatch, missing subdirectory, etc.).
+        """
+        code = resp.status_code
+
+        # --- explicit auth errors ---
+        if code in (401, 403):
             raise WordPressAuthError(
-                f"Authentication failed (HTTP {resp.status_code}). "
+                f"Authentication failed (HTTP {code}). "
                 "Check WP_USER and WP_APP_PASSWORD in .env."
             )
-        if resp.status_code == 404:
+
+        # --- not found ---
+        if code == 404:
             raise WordPressNotFoundError(f"Resource not found (HTTP 404): {resp.url}")
-        if resp.status_code >= 400:
+
+        # --- any non-2xx (including 3xx redirects and 5xx server errors) ---
+        if not (200 <= code < 300):
             try:
-                detail = resp.json().get("message", resp.text[:200])
+                detail = resp.json().get("message", resp.text[:300])
             except Exception:
-                detail = resp.text[:200]
-            raise WordPressAPIError(f"HTTP {resp.status_code}: {detail}")
+                detail = resp.text[:300] or f"(empty body, status {code})"
+            raise WordPressAPIError(f"HTTP {code}: {detail}")
+
+        # --- 2xx body may still contain a WP error envelope ---
+        # e.g. some WP configs return 200 with {"code":"rest_forbidden",...}
+        # We detect this early so callers always receive a real post object.
+        try:
+            body = resp.json()
+        except Exception:
+            return  # non-JSON 2xx; caller's _parse_json will raise properly
+
+        if isinstance(body, dict) and "code" in body and "id" not in body:
+            msg = body.get("message", str(body)[:200])
+            raise WordPressAPIError(
+                f"WordPress returned an error envelope (HTTP {code}): {msg}"
+            )
