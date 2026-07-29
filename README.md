@@ -1,70 +1,44 @@
 # SEO Agent
 
-An AI-powered platform designed to automate SEO workflows, streamline content production, and assist marketing teams with technical and strategic SEO tasks.
+> AI-powered framework for building and automating SEO workflows.
 
-> **Status:** 🚧 Active Development
+![Status](https://img.shields.io/badge/status-active%20development-orange)
+![Python](https://img.shields.io/badge/python-3.12-blue)
+![License](https://img.shields.io/badge/license-MIT-green)
 
 ---
 
 ## Overview
 
-SEO Agent is a modular AI platform built to help marketing teams and SEO professionals automate repetitive tasks while maintaining full control over strategy and decision-making.
+SEO Agent is a modular framework designed to simplify the development of AI-powered SEO workflows.
 
-The project is designed with scalability in mind, allowing new agents, integrations, and workflows to be added as the platform evolves.
+The project focuses on creating reusable agents capable of generating high-quality SEO content and serving as the foundation for future automation across technical SEO, content marketing, and WordPress publishing.
 
----
-
-## Core Objectives
-
-- Automate technical SEO workflows
-- Generate SEO-optimized content
-- Integrate with WordPress
-- Connect with Google Search Console
-- Support Google Analytics 4
-- Assist with Link Building strategies
-- Generate actionable SEO reports
+The current version focuses on establishing a scalable architecture and refining the blog generation workflow before expanding into additional SEO capabilities.
 
 ---
 
-## Current Features
+## Current Status
 
-- Modular architecture
+🚧 **Active Development**
+
+Current development focuses on:
+
+- Improving AI-generated blog quality
+- Refining prompts and templates
+- Expanding the agent architecture
+- Building a scalable foundation for future integrations
+
+---
+
+## Current Capabilities
+
+- Modular project architecture
 - AI Agent framework
 - Profile management
 - Prompt templates
 - Service layer
-- Configuration management
-
----
-
-## Roadmap
-
-### Phase 1 — Foundation
-- [x] Project architecture
-- [x] AI agent structure
-- [x] Profile system
-- [x] Prompt templates
-- [x] Configuration layer
-
-### Phase 2 — Integrations
-- [ ] WordPress REST API
-- [ ] Google Search Console
-- [ ] Google Analytics 4
-- [ ] Google Business Profile
-
-### Phase 3 — AI Workflows
-- [ ] SEO Audit
-- [ ] Keyword Research
-- [ ] Content Brief Generation
-- [ ] Blog Article Generation
-- [ ] Internal Linking
-- [ ] Metadata Optimization
-
-### Phase 4 — Automation
-- [ ] Automated Publishing
-- [ ] Monthly SEO Reports
-- [ ] SEO Monitoring
-- [ ] Link Building Assistant
+- Initial SEO blog generation workflow
 
 ---
 
@@ -72,16 +46,72 @@ The project is designed with scalability in mind, allowing new agents, integrati
 
 ```
 seo-agent/
-├── agents/
-├── config/
-├── profiles/
-├── services/
-├── templates/
-├── tools/
-├── wordpress/
-├── docs/
-└── tests/
+│
+├── agents/         # AI agents
+├── models/         # Data models
+├── profiles/       # Agent profiles
+├── services/       # Core services
+├── templates/      # Prompt templates
+├── tools/          # Utility functions
+├── wordpress/      # WordPress-related modules
+│
+├── config.py
+├── main.py
+├── requirements.txt
+└── agent.json
 ```
+
+---
+
+## Project Goals
+
+The long-term vision for SEO Agent includes:
+
+- SEO content generation
+- WordPress publishing
+- Technical SEO analysis
+- Internal linking suggestions
+- Keyword clustering
+- Google Search Console integration
+- Google Analytics integration
+- SEO reporting
+- Link Building automation
+
+These features are planned and are **not yet fully implemented**.
+
+---
+
+## Roadmap
+
+### Phase 1 — Foundation ✅
+
+- [x] Initial architecture
+- [x] Agent framework
+- [x] Profile system
+- [x] Prompt templates
+- [x] Service layer
+
+### Phase 2 — Content Generation 🚧
+
+- [x] Initial blog generation
+- [ ] Improve content quality
+- [ ] SEO optimization
+- [ ] Better prompt engineering
+
+### Phase 3 — Integrations
+
+- [ ] WordPress
+- [ ] Google Search Console
+- [ ] Google Analytics
+- [ ] Google Business Profile
+
+### Phase 4 — Automation
+
+- [ ] SEO audits
+- [ ] Metadata generation
+- [ ] Internal linking
+- [ ] Link Building workflows
+- [ ] Automated publishing
 
 ---
 
@@ -89,34 +119,31 @@ seo-agent/
 
 - Python
 - OpenAI API
-- WordPress REST API
-- Google Search Console API
-- Google Analytics Data API
+- Claude Code
 - Git
 - GitHub
-- Claude Code
 
 ---
 
 ## Documentation
 
-Project documentation is available in the `/docs` directory.
+Project documentation will be expanded as development progresses.
 
 Future documentation will include:
 
-- Architecture
-- Development Log
-- API Integrations
-- Prompt Engineering
-- Deployment Guide
+- System architecture
+- Development log
+- Prompt engineering
+- API integrations
+- Deployment guide
 
 ---
 
-## Development Status
+## Contributing
 
 SEO Agent is currently under active development.
 
-Features, integrations, and documentation are continuously expanded as the platform evolves.
+As the project matures, contribution guidelines and additional documentation will be published.
 
 ---
 
