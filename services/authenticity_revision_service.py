@@ -96,8 +96,9 @@ ABSOLUTE RULES — NEVER VIOLATE THESE
 
 9. CTA paragraphs: keep the call-to-action intent. Rewrite the phrasing to sound human.
 
-10. Article length must remain approximately the same.
-    Do not pad. Do not cut more than 10% of word count.
+10. Target article length: 800 words (acceptable range 700–900, absolute maximum 950).
+    Do not pad. If the article exceeds 900 words, trim the weakest padding sentences to
+    bring it within range. Never cut factual claims, technical specifics, or keyword placements.
 
 ══════════════════════════════════════════════════
 WHAT TO REWRITE — EVERY PARAGRAPH'S PROSE
@@ -280,10 +281,13 @@ class AuthenticityRevisionService:
             title[:60], len(body),
         )
 
+        _words = len(body.split())
         return article.model_copy(update={
             "title": title,
             "content_markdown": body,
             "seo": seo,
+            "word_count": _words,
+            "reading_time_minutes": max(1, _words // 200),
         })
 
     # ── Internal helpers ──────────────────────────────────────────────────────

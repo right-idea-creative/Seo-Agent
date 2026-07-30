@@ -102,7 +102,7 @@ class ClaudeService:
             duration = time.perf_counter() - t0
 
             if self._budget is not None and final.usage:
-                self._budget.record_claude(final.usage.input_tokens, final.usage.output_tokens)
+                self._budget.record_claude(final.usage.input_tokens, final.usage.output_tokens, model=effective_model)
 
             if final.usage:
                 thinking_tokens = getattr(final.usage, "thinking_tokens", None)
@@ -129,9 +129,12 @@ class ClaudeService:
 
         except anthropic.RateLimitError as exc:
             logger.warning("Claude rate limit reached: %s", exc)
-            raise ClaudeRateLimitError("Rate limit exceeded — try again later.") from exc
+            raise ClaudeRateLimitError(str(exc)) from exc
 
         except anthropic.APIError as exc:
+            if getattr(exc, "status_code", None) == 400 and "usage limit" in str(exc).lower():
+                logger.warning("Anthropic usage limit reached: %s", exc)
+                raise ClaudeRateLimitError(str(exc)) from exc
             logger.error("Claude API error: %s", exc)
             raise ClaudeAPIError(str(exc), status_code=getattr(exc, "status_code", None)) from exc
 
@@ -190,7 +193,7 @@ class ClaudeService:
             duration = time.perf_counter() - t0
 
             if self._budget is not None and response.usage:
-                self._budget.record_claude(response.usage.input_tokens, response.usage.output_tokens)
+                self._budget.record_claude(response.usage.input_tokens, response.usage.output_tokens, model=effective_model)
 
             if response.usage:
                 call_tracer.record(
@@ -212,9 +215,12 @@ class ClaudeService:
 
         except anthropic.RateLimitError as exc:
             logger.warning("Claude rate limit reached: %s", exc)
-            raise ClaudeRateLimitError("Rate limit exceeded — try again later.") from exc
+            raise ClaudeRateLimitError(str(exc)) from exc
 
         except anthropic.APIError as exc:
+            if getattr(exc, "status_code", None) == 400 and "usage limit" in str(exc).lower():
+                logger.warning("Anthropic usage limit reached: %s", exc)
+                raise ClaudeRateLimitError(str(exc)) from exc
             logger.error("Claude API error: %s", exc)
             raise ClaudeAPIError(str(exc), status_code=getattr(exc, "status_code", None)) from exc
 

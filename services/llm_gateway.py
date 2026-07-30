@@ -12,10 +12,11 @@ Failover behaviour:
   1. Try primary provider (Claude).
   2. On a recoverable error, print a console notice and try the fallback (OpenAI).
   3. If both fail, print both errors and raise LLMAllProvidersFailedError.
-  4. Non-recoverable errors (400, 401) surface immediately — no failover.
+  4. Non-recoverable errors (401, 400*) surface immediately — no failover.
+     *400 "usage limit" is re-raised as ClaudeRateLimitError so failover applies.
 
 Recoverable errors:
-  - HTTP status codes: 402, 429, 500, 502, 503, 504
+  - HTTP status codes: 402, 429, 500, 502, 503, 504, 529
   - Message keywords:  credit, insufficient, quota, timeout, connection,
                        unavailable, overloaded
 
@@ -56,7 +57,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 _console = Console()
 
-_RECOVERABLE_STATUS_CODES: frozenset[int] = frozenset({402, 429, 500, 502, 503, 504})
+_RECOVERABLE_STATUS_CODES: frozenset[int] = frozenset({402, 429, 500, 502, 503, 504, 529})
 
 _RECOVERABLE_KEYWORDS: tuple[str, ...] = (
     "credit",
@@ -277,7 +278,7 @@ class LLMGateway:
     @staticmethod
     def _error_reason(exc: ClaudeServiceError) -> str:
         if isinstance(exc, ClaudeRateLimitError):
-            return "rate limit exceeded"
+            return str(exc) or "rate limit exceeded"
         if isinstance(exc, ClaudeAPIError) and exc.status_code:
             _labels = {
                 402: "insufficient credits",

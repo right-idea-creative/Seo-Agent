@@ -98,28 +98,10 @@ class SectionPlan(BaseModel):
     # ── Structure ─────────────────────────────────────────────────────────────
     heading: str = Field(description="Section heading text — no # prefix")
 
-    # ── Reader understanding ──────────────────────────────────────────────────
-    reader_intent: str = Field(
-        default="",
-        description="What the reader wants to understand or accomplish from this section",
-    )
-    reader_misconception: str = Field(
-        default="",
-        description="The wrong belief most readers hold about this section's topic",
-    )
-    why_misconception_forms: str = Field(
-        default="",
-        description="Why this misconception is natural and intuitive",
-    )
-
     # ── Technical core ────────────────────────────────────────────────────────
     technical_reality: str = Field(
         default="",
         description="The accurate technical fact that corrects the misconception",
-    )
-    failure_mechanism: str = Field(
-        default="",
-        description="The physical sequence that results when someone acts on the misconception",
     )
     professional_insight: str = Field(
         default="",
@@ -221,9 +203,6 @@ class ArticlePlan(BaseModel):
     )
     hook_angle: str = Field(
         description="The reader assumption that the opening sentence will challenge or reframe",
-    )
-    what_reader_gets_wrong: str = Field(
-        description="The primary misconception the whole article corrects",
     )
 
     # ── Local context ─────────────────────────────────────────────────────────

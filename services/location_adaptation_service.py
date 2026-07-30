@@ -248,10 +248,13 @@ class LocationAdaptationService:
         if new_seo is not article.seo:
             report.seo_adapted = True
 
+        _words = len(new_markdown.split())
         adapted = article.model_copy(update={
             "title": new_title,
             "content_markdown": new_markdown,
             "seo": new_seo,
+            "word_count": _words,
+            "reading_time_minutes": max(1, _words // 200),
         })
         return adapted, report
 

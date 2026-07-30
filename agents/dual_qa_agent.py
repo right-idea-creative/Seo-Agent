@@ -90,7 +90,7 @@ def _restore_displaced_markers(pre_revision: str, post_revision: str) -> str:
 
         if best_heading and best_overlap > 0:
             # Remove marker from its displaced end position; insert before the matched heading
-            result = _re.sub(r'\n*' + _re.escape(marker) + r'\n*', '\n\n', result).strip() + '\n'
+            result = _re.sub(r'\n*' + _re.escape(marker) + r'\n*', '\n\n', result).rstrip('\n') + '\n'
             result = result.replace(best_heading, f'{marker}\n{best_heading}', 1)
             logger.warning(
                 "Marker %s was displaced to end during QA revision — "
@@ -230,6 +230,11 @@ Technical SEO
 • Meta description: 120–160 chars, includes keyword, compelling?
 • SEO title: 50–60 chars, includes keyword, enticing?
 • Internal links: at least one to a relevant page?
+  MANDATORY — check "INTERNAL LINKS CONFIGURED" in the article header before scoring:
+  → If INTERNAL LINKS CONFIGURED: No — EXCLUDE this criterion entirely from your score.
+    Award full credit. Do NOT deduct points. Do NOT list it as a weakness or improvement.
+    Treat it as N/A. Scoring it would penalize a configuration choice, not an article flaw.
+  → If INTERNAL LINKS CONFIGURED: Yes — evaluate normally; penalize if no internal links present.
 • External links: 1–2 authoritative, non-competing sources?
 • Slug: short, lowercase, keyword-focused?
 
@@ -239,6 +244,10 @@ Local SEO
 
 Content Structure
 • FAQ section with questions real users ask?
+  SPECIFICATION: 3–4 FAQ questions is the CORRECT format for this content type.
+  Do NOT deduct points for having 3–4 questions. Do NOT request more questions.
+  Only penalize if: the FAQ section is entirely absent, OR the questions are
+  irrelevant/generic and not tied to real user intent for this topic.
 • CTA: clear, specific, relevant to the service?
 • Tables or lists where they genuinely help (not filler)?
 
@@ -337,6 +346,11 @@ Reuse as little phrasing from the previous draft as possible.
 Technical terms (product names, trade terms, city names, service categories) are not
 "phrasing" and may be used freely. Everything else — how sentences are constructed,
 how paragraphs open, how ideas connect — should be freshly written.
+
+WORD COUNT:
+Target: 800 words — acceptable 700–900 — absolute maximum 950.
+If the current article exceeds 900 words, trim the weakest sentences and padding
+to bring it within range. Never cut factual claims, technical specifics, or keyword placements.
 
 ABSOLUTE RULES — NEVER VIOLATE:
 1. Preserve ALL image placeholder comments EXACTLY as written:
@@ -486,6 +500,7 @@ class DualQAAgent:
         min_vision_claude: int = 90,
         min_vision_openai: int = 90,
         max_cycles: int = 3,
+        enable_rescue: bool = True,
     ) -> None:
         self._claude = claude
         self._openai = openai_reviewer
@@ -496,6 +511,7 @@ class DualQAAgent:
         self._min_vision_claude = min_vision_claude
         self._min_vision_openai = min_vision_openai
         self._max_cycles = max_cycles
+        self._enable_rescue = enable_rescue
 
     # ── Public interface ──────────────────────────────────────────────────────
 
@@ -560,23 +576,27 @@ class DualQAAgent:
             # OpenAI review
             if self._openai is not None:
                 openai_result = self._openai_review_article(current)
+                openai_approved = (
+                    openai_result["writing_score"] >= self._min_writing
+                    and openai_result["authenticity_score"] >= self._min_authenticity
+                )
             else:
-                logger.warning("OpenAI reviewer not configured — Claude-only review mode.")
+                logger.warning(
+                    "OpenAI reviewer not configured — writing/authenticity scores unavailable. "
+                    "OpenAI QA gate bypassed. Scores reported as 0 (not measured)."
+                )
                 openai_result = {
-                    "writing_score": 100, "authenticity_score": 100, "approved": True,
-                    "writing_feedback": "OpenAI reviewer not configured.",
-                    "authenticity_feedback": "OpenAI reviewer not configured.",
+                    "writing_score": 0, "authenticity_score": 0, "approved": False,
+                    "writing_feedback": "OpenAI reviewer not configured — check skipped.",
+                    "authenticity_feedback": "OpenAI reviewer not configured — check skipped.",
                     "issues": [], "revision_instructions": "",
                 }
+                openai_approved = True  # explicit bypass, not score-derived
 
             # Assemble iteration
             claude_approved = (
                 claude_result.get("seo_score", 0) >= self._min_seo
                 and claude_result.get("editorial_score", 0) >= self._min_editorial
-            )
-            openai_approved = (
-                openai_result["writing_score"] >= self._min_writing
-                and openai_result["authenticity_score"] >= self._min_authenticity
             )
 
             combined_openai_feedback = "\n".join(filter(None, [
@@ -667,7 +687,7 @@ class DualQAAgent:
 
                 # Authenticity rescue: if SEO + Editorial passed but only
                 # Human Writing / Authenticity failed, try one dedicated rewrite.
-                if iteration.claude_approved and not iteration.openai_approved:
+                if self._enable_rescue and iteration.claude_approved and not iteration.openai_approved:
                     rescue_article = self._try_authenticity_rescue(
                         current, iteration, openai_result, report, _snap, _claude_delta
                     )
@@ -685,7 +705,12 @@ class DualQAAgent:
         if image_plan is not None:
             restored_md = self._restore_dropped_markers(current.content_markdown, image_plan)
             if restored_md != current.content_markdown:
-                current = current.model_copy(update={"content_markdown": restored_md})
+                _rm_words = len(restored_md.split())
+                current = current.model_copy(update={
+                    "content_markdown": restored_md,
+                    "word_count": _rm_words,
+                    "reading_time_minutes": max(1, _rm_words // 200),
+                })
 
         # ── SEO regen: one call on the final passing article ─────────────────
         # Only run when the article was actually revised (title could differ from original).
@@ -820,6 +845,7 @@ class DualQAAgent:
                 ],
             },
             max_tokens=3000,
+            thinking=False,
         )
 
     def _openai_review_article(self, article: Article) -> dict:
@@ -859,19 +885,35 @@ class DualQAAgent:
         from agents.article_agent import ArticleAgent
 
         # Rebuild article preserving identity and tenant context.
-        # SEO metadata is intentionally NOT regenerated here — reviewers evaluate the body.
-        # SEO is regenerated once after the article finally passes (in run()).
         title = ArticleAgent._extract_title(revised_content) or article.title
         body = ArticleAgent._strip_h1(revised_content)
 
         # Re-anchor any markers that Claude displaced to the end during structural revision
         body = _restore_displaced_markers(article.content_markdown, body)
 
+        _rev_words = len(body.split())
         revised = article.model_copy(update={
             "title": title,
             "content_markdown": body,
-            # seo intentionally unchanged — regenerated once when the article passes
+            "word_count": _rev_words,
+            "reading_time_minutes": max(1, _rev_words // 200),
         })
+
+        # Regenerate SEO when the current cycle's SEO score was below threshold.
+        # This ensures the next QA cycle evaluates a fresh seo_title rather than
+        # re-scoring the same stale metadata that caused the failure.
+        if iteration.seo_score < self._min_seo:
+            try:
+                _seo = ArticleAgent(service=self._claude)._generate_seo(
+                    article.request, body
+                )
+                revised = revised.model_copy(update={"seo": _seo})
+                logger.info(
+                    "SEO metadata regenerated after revision (cycle SEO score was %d < %d).",
+                    iteration.seo_score, self._min_seo,
+                )
+            except Exception as exc:
+                logger.warning("SEO regen after revision failed (non-blocking): %s", exc)
 
         # Compliance check — verify each instruction was actually applied.
         # Disabled by default (12k-22k tokens per revision, reporting only).
@@ -1533,10 +1575,11 @@ class DualQAAgent:
                 openai_feedback = openai_result.get("feedback", "")
             except Exception as exc:
                 logger.warning(
-                    "OpenAI vision review failed for %s: %s — treating as passed.", image_id, exc
+                    "OpenAI vision review failed for %s: %s — image marked as failed.",
+                    image_id, exc,
                 )
-                openai_score = 100
-                openai_feedback = f"Review unavailable: {exc}"
+                openai_score = 0
+                openai_feedback = f"Review failed: {exc}"
             openai_approved = openai_score >= self._min_vision_openai
         else:
             openai_score = 100
@@ -1657,17 +1700,23 @@ class DualQAAgent:
                 "required": ["vision_score", "feedback"],
             },
             max_tokens=1024,
+            thinking=False,
         )
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
     @staticmethod
     def _format_for_review(article: Article) -> str:
+        has_links = bool(
+            getattr(article, "request", None)
+            and getattr(article.request, "internal_links_to_include", None)
+        )
         return (
             f"SEO TITLE: {article.seo.seo_title}\n"
             f"META DESCRIPTION: {article.seo.meta_description}\n"
             f"FOCUS KEYWORD: {article.seo.focus_keyword}\n"
-            f"SLUG: {article.seo.slug}\n\n"
+            f"SLUG: {article.seo.slug}\n"
+            f"INTERNAL LINKS CONFIGURED: {'Yes' if has_links else 'No'}\n\n"
             f"ARTICLE (H1 + body):\n---\n"
             f"# {article.title}\n\n"
             f"{article.content_markdown}\n---"

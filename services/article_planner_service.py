@@ -94,24 +94,30 @@ writing a single word.
 HOW TO REASON — SEQUENCE FOR EACH SECTION
 ══════════════════════════════════════════════════
 
-Work through this sequence for each major section:
+Work through this reasoning sequence for each major section. Steps 1–4 are your
+internal reasoning scaffold — think through them before writing any output field.
+They exist to sharpen technical_reality and professional_insight. Do not output
+them as separate schema keys.
 
+  INTERNAL REASONING (think through, do not output as fields):
   1. Reader intent — What is the reader actually trying to accomplish?
   2. Reader misconception — What do most homeowners believe that is wrong?
   3. Why it forms — Why is this misconception so natural and persistent?
-  4. Technical reality — What is actually true?
-  5. Failure mechanism — What physically happens when someone acts on the misconception?
-  6. Professional insight — What does a 15-year veteran know that the homeowner doesn't?
-  7. Local calibration — How does TARGET LOCATION modify the generic advice?
-  8. Safety — Where are the physical risks? What must never be attempted without training?
-  9. Diagnostic tests — What can the homeowner safely do to evaluate their situation?
-  10. Decision criteria — The concrete factors that determine the right choice.
-  11. Realistic limitations — What would an honest professional acknowledge can go wrong?
-  12. Preventive advice — What prevents or slows this problem?
-  13. Counter-intuitive facts — What correct facts would surprise most readers?
-  14. Why-not examples — Name the wrong approach, state the prohibition,
-      explain the exact mechanical or physical reason.
-  15. Specific numbers — Cycles, years, cost ranges, intervals, dimensions, percentages.
+  4. Failure mechanism — What physically happens when someone acts on the misconception?
+
+  OUTPUT FIELDS (populate after completing your internal reasoning above):
+  5. technical_reality — The accurate technical fact, made sharper by your
+     misconception analysis. Be specific about what is wrong and exactly why.
+  6. professional_insight — What the 15-year veteran knows that a layperson would not.
+  7. local_factors — How TARGET LOCATION modifies the generic advice.
+  8. safety_considerations — Physical risks. Empty string if none.
+  9. diagnostic_tests — What a homeowner can safely do to evaluate their situation.
+  10. decision_criteria — Concrete factors that determine the right choice.
+  11. realistic_limitations — What an honest professional would acknowledge can go wrong.
+  12. preventive_advice — What prevents or slows this problem.
+  13. counter_intuitive_facts — Correct facts that would surprise most readers.
+  14. why_not_examples — Wrong approach → prohibition → exact mechanical or physical reason.
+  15. specific_numbers — Cycles, years, cost ranges, intervals, dimensions, percentages.
       Only include numbers you are confident are accurate for the trade.
 
 ══════════════════════════════════════════════════
@@ -145,14 +151,14 @@ A plausible-sounding number you aren't certain of is more damaging than no numbe
 SECTION PLANNING
 ══════════════════════════════════════════════════
 
-Plan 5–8 major H2 sections that cover the topic comprehensively:
+Plan 3–4 major H2 sections that cover the topic concisely (target article: 800 words):
   • Introduction angle (not a section — this shapes the hook_angle field)
-  • Core technical sections that progress logically
+  • Core technical sections that progress logically — prioritize the 3–4 most important
   • A cost/timing section when the topic involves decisions about money
-  • A safety section when the topic has physical risks
   • A DIY vs. professional section when the topic involves that choice
-  • A FAQ section (captured in faq_plans — 5 questions, real search-query phrasing)
+  • A FAQ section (captured in faq_plans — 3–4 questions, real search-query phrasing)
   • A conclusion angle (captured in conclusion_angle)
+Keep sections focused — each should cover one clear sub-topic in roughly 150 words of prose.
 
 ══════════════════════════════════════════════════
 IMAGE PLANNING
@@ -209,25 +215,9 @@ def _build_planner_schema() -> dict[str, Any]:
                     "always write the actual city name and service name."
                 ),
             },
-            "reader_intent": {
-                "type": "string",
-                "description": "What the reader wants to understand or accomplish from this section",
-            },
-            "reader_misconception": {
-                "type": "string",
-                "description": "The wrong belief most readers hold about this section's topic",
-            },
-            "why_misconception_forms": {
-                "type": "string",
-                "description": "Why this misconception is natural and intuitive",
-            },
             "technical_reality": {
                 "type": "string",
                 "description": "The accurate technical fact that corrects the misconception",
-            },
-            "failure_mechanism": {
-                "type": "string",
-                "description": "The physical sequence that results when someone acts on the misconception",
             },
             "professional_insight": {
                 "type": "string",
@@ -306,11 +296,7 @@ def _build_planner_schema() -> dict[str, Any]:
         },
         "required": [
             "heading",
-            "reader_intent",
-            "reader_misconception",
-            "why_misconception_forms",
             "technical_reality",
-            "failure_mechanism",
             "professional_insight",
         ],
     }
@@ -350,10 +336,6 @@ def _build_planner_schema() -> dict[str, Any]:
                     "The reader assumption that the opening sentence will challenge or reframe. "
                     "This is the idea, not a sentence — the writer creates the prose."
                 ),
-            },
-            "what_reader_gets_wrong": {
-                "type": "string",
-                "description": "The primary misconception the whole article corrects",
             },
             "local_context_foundation": {
                 "type": "string",
@@ -408,13 +390,13 @@ def _build_planner_schema() -> dict[str, Any]:
             "section_plans": {
                 "type": "array",
                 "items": section_schema,
-                "description": "Reasoning plan for each major section, in document order. Plan 5–8 sections.",
+                "description": "Reasoning plan for each major section, in document order. Plan 3–4 sections.",
             },
             "faq_plans": {
                 "type": "array",
                 "items": faq_schema,
                 "description": (
-                    "5 FAQ questions targeting actual search queries. "
+                    "3–4 FAQ questions targeting actual search queries. "
                     "Include city name and specific condition in each question."
                 ),
             },
@@ -512,7 +494,6 @@ def _build_planner_schema() -> dict[str, Any]:
         "required": [
             "article_thesis",
             "hook_angle",
-            "what_reader_gets_wrong",
             "local_context_foundation",
             "primary_counter_intuition",
             "primary_prohibition",
@@ -573,8 +554,8 @@ class ArticlePlannerService:
                     "or decision framework."
                 ),
                 input_schema=_build_planner_schema(),
-                max_tokens=8000,
-                thinking=True,
+                max_tokens=5000,
+                thinking=False,
                 model=_settings.planner_model,
                 label="plan:article",
             )
@@ -623,9 +604,10 @@ class ArticlePlannerService:
             "",
             "TASK:",
             "Build the complete technical reasoning plan for this article.",
-            "Plan 5–8 major H2 sections that cover the topic comprehensively.",
+            "Plan 3–4 major H2 sections (target 800 words — keep each section focused).",
             "For each section, work through the full expert reasoning sequence.",
-            "Include 5 FAQ questions using real search-query phrasing with city name.",
+            "Include 3–4 FAQ questions using real search-query phrasing with city name.",
+            "Include image_plans — img_001 is ALWAYS the featured image. Never submit an empty image_plans array.",
             "",
             "REMEMBER:",
             "• Think like someone who has done this work — not read about it.",
@@ -652,11 +634,7 @@ class ArticlePlannerService:
         def _section(s: dict[str, Any]) -> SectionPlan:
             return SectionPlan(
                 heading=_str(s.get("heading")),
-                reader_intent=_str(s.get("reader_intent")),
-                reader_misconception=_str(s.get("reader_misconception")),
-                why_misconception_forms=_str(s.get("why_misconception_forms")),
                 technical_reality=_str(s.get("technical_reality")),
-                failure_mechanism=_str(s.get("failure_mechanism")),
                 professional_insight=_str(s.get("professional_insight")),
                 local_factors=_strlist(s.get("local_factors")),
                 safety_considerations=_str(s.get("safety_considerations")),
@@ -697,7 +675,6 @@ class ArticlePlannerService:
         return ArticlePlan(
             article_thesis=_str(raw.get("article_thesis")),
             hook_angle=_str(raw.get("hook_angle")),
-            what_reader_gets_wrong=_str(raw.get("what_reader_gets_wrong")),
             local_context_foundation=_str(raw.get("local_context_foundation")),
             regional_specifics=_strlist(raw.get("regional_specifics")),
             primary_counter_intuition=_str(raw.get("primary_counter_intuition")),

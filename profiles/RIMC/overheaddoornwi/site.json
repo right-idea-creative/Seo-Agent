@@ -2,9 +2,15 @@
   "client_id": "RIMC",
   "website_id": "overheaddoornwi",
   "business_name": "ODC Northwest Indiana",
-  "niche": "",
-  "primary_service": "",
-  "secondary_services": [],
+  "niche": "Overhead Door",
+  "primary_service": "Overhead Door Repair",
+  "secondary_services": [
+    "Garage Door Repair",
+    "Garage Door Installation",
+    "Garage Door Opener Repair",
+    "Spring Replacement",
+    "Commercial Door Service"
+  ],
   "city": "Northwest Indiana",
   "state": "IN",
   "country": "USA",

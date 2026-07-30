@@ -28,6 +28,14 @@ class TenantContext(BaseModel):
         default=None,
         description="Franchise, branch, or dealer identifier (if the client uses a franchise model)."
     )
+    reuse_group: str | None = Field(
+        default=None,
+        description=(
+            "Opt-in draft-reuse pool. Websites sharing the same non-empty value "
+            "may reuse each other's drafts across client boundaries. "
+            "Populated from SiteProfile.reuse_group at article-creation time."
+        ),
+    )
 
     @field_validator("client_id", "website_id")
     @classmethod

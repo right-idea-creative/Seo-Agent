@@ -18,7 +18,7 @@ class Settings(BaseSettings):
 
     # Anthropic
     anthropic_api_key: str
-    claude_model: str = "claude-opus-4-8"
+    claude_model: str = "claude-sonnet-4-6"
 
     # Per-stage model routing — override individual stages without touching generation quality.
     # Article generation stays on Opus; everything else defaults to Sonnet or Haiku.
@@ -27,7 +27,7 @@ class Settings(BaseSettings):
         description="Claude model for article technical planning.",
     )
     seo_model: str = Field(
-        default="claude-sonnet-4-6",
+        default="claude-haiku-4-5-20251001",
         description="Claude model for SEO metadata generation.",
     )
     qa_model: str = Field(
@@ -43,7 +43,7 @@ class Settings(BaseSettings):
         description="Claude model for topic suggestion.",
     )
     image_eval_model: str = Field(
-        default="claude-sonnet-4-6",
+        default="claude-haiku-4-5-20251001",
         description="Claude model for Drive photo relevance scoring.",
     )
     edit_prompt_model: str = Field(
@@ -54,7 +54,7 @@ class Settings(BaseSettings):
     # Article defaults
     default_language: ArticleLanguage = ArticleLanguage.EN
     default_tone: ArticleTone = ArticleTone.PROFESIONAL
-    default_word_count: int = 850
+    default_word_count: int = 800
     min_article_words: int = Field(
         default=700,
         ge=100,
@@ -65,11 +65,20 @@ class Settings(BaseSettings):
     output_dir: Path = Path("output/articles")
 
     # SEO QA
+    # Two separate SEO score thresholds exist intentionally:
+    #   seo_qa_min_score (70): post-publish certification gate — checks the live URL
+    #       after WordPress publish to confirm the content scored above baseline.
+    #   qa_min_seo (90): pre-publish DualQA gate — Claude scores the draft before
+    #       any publish attempt; stricter because it drives revision cycles.
     seo_qa_min_score: int = Field(
         default=70,
         ge=0,
         le=100,
-        description="Minimum SEO quality score required to publish (0-100).",
+        description=(
+            "Post-publish certification SEO gate. Checks the live URL after WordPress "
+            "publish. Lower than qa_min_seo because it is informational only — "
+            "the article is already live; the certification report flags regressions."
+        ),
     )
 
     # Credentials
@@ -94,7 +103,7 @@ class Settings(BaseSettings):
         description="Hard cap on combined monthly API spend (Claude + OpenAI). Pipeline stops when reached.",
     )
     max_article_cost_usd: float = Field(
-        default=0.55,
+        default=0.25,
         ge=0,
         description="Target per-article API cost (USD). A warning is printed when exceeded.",
     )
@@ -174,7 +183,7 @@ class Settings(BaseSettings):
         ),
     )
     qa_max_cycles: int = Field(
-        default=3, ge=1, le=10,
+        default=1, ge=1, le=10,
         description="Maximum article revision cycles before aborting with a QA failure report.",
     )
     qa_min_seo: int = Field(default=90, ge=0, le=100, description="Minimum Claude SEO score to pass.")
@@ -190,6 +199,13 @@ class Settings(BaseSettings):
     openai_vision_review_model: str = Field(
         default="gpt-4o-mini",
         description="OpenAI model for image vision review.",
+    )
+    qa_rescue_enabled: bool = Field(
+        default=False,
+        description=(
+            "Attempt a dedicated authenticity rewrite when Claude passes but OpenAI fails. "
+            "Costs ~$0.110 per activation. Disable to guarantee per-article cost stays under $0.25."
+        ),
     )
     qa_compliance_check: bool = Field(
         default=False,

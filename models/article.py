@@ -45,14 +45,14 @@ class ArticleRequest(BaseModel):
     # ── Writing configuration ─────────────────────────────────
 
     language: ArticleLanguage = Field(
-        default=ArticleLanguage.ES,
+        default=ArticleLanguage.EN,
         description="Language of the generated article."
     )
     word_count: int = Field(
-        default=850,
+        default=800,
         ge=300,
         le=10000,
-        description="Target word count for the article body. Production target: 850 words (700–1000).",
+        description="Target word count for the article body. Production target: 800 words (700–900, hard cap 950).",
     )
     tone: ArticleTone = Field(
         default=ArticleTone.PROFESIONAL,
@@ -108,8 +108,8 @@ class SEOMetadata(BaseModel):
         description="Title tag — 60 chars max recommended for full SERP display."
     )
     meta_description: str = Field(
-        max_length=170,
-        description="Meta description — 160 chars max recommended."
+        max_length=160,
+        description="Meta description — 120–160 characters. Hard max is 160."
     )
     slug: str = Field(
         description="URL-safe slug, e.g. 'reparacion-puertas-garaje-denver'."

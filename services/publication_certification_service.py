@@ -8,6 +8,7 @@ Sections: GENERAL, CONTENT, SEO, LINKS, IMAGES, EDITORIAL, WORDPRESS, QUALITY.
 """
 from __future__ import annotations
 
+import html as _html
 import re
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -201,11 +202,15 @@ class PublicationCertificationService:
         if live_post:
             rendered = live_post.get("title", {})
             live_title = rendered.get("rendered", "") if isinstance(rendered, dict) else str(rendered)
+            live_title = _html.unescape(live_title)
         titles_match = bool(live_title and article.title.strip() in live_title)
         report.items.append(CertificationItem(
             section, "Title published",
-            bool(live_title),
-            live_title[:80] if live_title else "Title missing from live post",
+            titles_match,
+            live_title[:80] if titles_match else (
+                f"Title mismatch — expected '{article.title[:60]}', got '{live_title[:60]}'"
+                if live_title else "Title missing from live post"
+            ),
         ))
 
         # HTML body present in live post
@@ -316,7 +321,6 @@ class PublicationCertificationService:
 
         # Count all markdown links to verify enricher ran
         all_links = re.findall(r'\[([^\]]+)\]\(([^)]+)\)', markdown)
-        internal_links = [href for _, href in all_links if href.startswith("http") and not href.startswith("http://example")]
         links_ok = links_added >= 1
         report.items.append(CertificationItem(
             section, "Internal links inserted",

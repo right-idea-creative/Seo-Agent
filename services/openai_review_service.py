@@ -336,13 +336,13 @@ class OpenAIReviewService:
     @staticmethod
     def _normalize_article_review(raw: dict) -> dict:
         return {
-            "writing_score": int(raw.get("writing_score", 0)),
+            "writing_score": int(raw.get("writing_score") or 0),
             "writing_reasoning": str(raw.get("writing_reasoning", "")),
             "writing_strengths": list(raw.get("writing_strengths", [])),
             "writing_weaknesses": list(raw.get("writing_weaknesses", [])),
             "writing_improvements": list(raw.get("writing_improvements", [])),
             "writing_priority": str(raw.get("writing_priority", "")),
-            "authenticity_score": int(raw.get("authenticity_score", 0)),
+            "authenticity_score": int(raw.get("authenticity_score") or 0),
             "authenticity_reasoning": str(raw.get("authenticity_reasoning", "")),
             "authenticity_strengths": list(raw.get("authenticity_strengths", [])),
             "authenticity_weaknesses": list(raw.get("authenticity_weaknesses", [])),
@@ -358,7 +358,7 @@ class OpenAIReviewService:
     @staticmethod
     def _normalize_image_review(raw: dict) -> dict:
         return {
-            "vision_score": int(raw.get("vision_score", 0)),
+            "vision_score": int(raw.get("vision_score") or 0),
             "approved": bool(raw.get("approved", False)),
             "feedback": str(raw.get("feedback", "")),
             "ai_artifacts_found": list(raw.get("ai_artifacts_found", [])),

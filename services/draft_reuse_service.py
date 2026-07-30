@@ -234,18 +234,19 @@ class DraftReuseService:
         What changes:
           - tenant updated to caller's client_id / website_id
           - request replaced with the current request
-          - WordPress-specific fields (post_id, post_url, status) cleared
+          - WordPress-specific fields (post_id, post_url) cleared; publishing reset to defaults
+          - Article lifecycle status reset to REVIEW (ready for publication pipeline)
 
         What is preserved verbatim:
           - title, content_markdown, image_plans, word_count, reading_time
           - seo metadata (caller must regenerate website-specific SEO fields after adapt)
         """
-        from models.enums import PublishStatus
+        from models.enums import ArticleStatus
         from models.publishing import PublishingOptions
 
         return match.article.model_copy(update={
             "tenant": tenant,
             "request": request,
             "publishing": PublishingOptions(),
-            "status": PublishStatus.DRAFT,
+            "status": ArticleStatus.REVIEW,
         })

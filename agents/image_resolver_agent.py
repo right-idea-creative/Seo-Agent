@@ -383,7 +383,7 @@ Nothing more than the minimum necessary change.\
             tool_description="Create the image placement plan for this article.",
             input_schema=_PLANNING_SCHEMA,
             max_tokens=4096,
-            thinking=True,
+            thinking=False,
             model=_settings.image_eval_model,
             label="image:plan",
         )
@@ -744,7 +744,8 @@ Nothing more than the minimum necessary change.\
         thumbnails: list[tuple[DriveFileInfo, bytes]] = []
         kw_scores: list[int] = []
         for file_info, kw_score in pool:
-            assert self._drive is not None
+            if self._drive is None:
+                raise RuntimeError("DriveService not initialized — cannot download thumbnails.")
             try:
                 if file_info.thumbnail_link:
                     try:
@@ -852,7 +853,8 @@ Nothing more than the minimum necessary change.\
         if similarity_score == 0:
             reason = f"No suitable Drive image found by Claude Vision. {clean_reasoning}"
 
-        assert self._drive is not None
+        if self._drive is None:
+            raise RuntimeError("DriveService not initialized — cannot download winning image.")
         image_bytes = self._drive.download(winner_file.file_id)
 
         folder = winner_file.folder_path.strip("/")
@@ -972,7 +974,7 @@ Nothing more than the minimum necessary change.\
                 score = max(0, min(100, int(entry.get("score", 0))))
                 if 1 <= one_based <= len(thumbnails):
                     scored.append((one_based - 1, score))  # convert to 0-based
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, AttributeError):
                 continue
 
         scored.sort(key=lambda x: x[1], reverse=True)
@@ -1061,7 +1063,8 @@ Requested edit: """
             alt_text=req.alt_text,
             size="1536x1024",
         )
-        assert self._generator is not None
+        if self._generator is None:
+            raise RuntimeError("ImageGenerator not initialized — cannot generate variation.")
         edited_asset = self._generator.generate_variation(  # type: ignore[attr-defined]
             reference_images=[reference_asset.data],
             request=gen_req,
@@ -1157,7 +1160,7 @@ Requested edit: """
             },
             max_tokens=400,
             thinking=False,
-            model=_settings.image_eval_model,
+            model=_settings.edit_prompt_model,
             label="image:edit-prompt",
         )
         logger.debug(

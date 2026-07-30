@@ -416,7 +416,7 @@ class DraftPoolService:
         entries: list[PoolEntry] = []
         for path in self._output_dir.glob("**/article.json"):
             # Skip pool-adjacent temp files and checkpoints
-            if ".checkpoints" in str(path) or path.name != "article.json":
+            if ".checkpoints" in str(path):
                 continue
             try:
                 article = Article.model_validate_json(path.read_text(encoding="utf-8"))

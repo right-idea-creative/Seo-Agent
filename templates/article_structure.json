@@ -1,6 +1,6 @@
 {
-  "version": "1.0.0",
-  "description": "Structural template for local-service SEO buyer-guide articles",
+  "version": "1.1.0",
+  "description": "Structural template for local-service SEO buyer-guide articles (800-word target)",
   "canonical_source": "output/articles/RIMC/overheaddoorgnv/choose-reliable-overhead-door-service-gainesville-fl/article.md",
 
   "_update_instructions": [
@@ -18,8 +18,8 @@
       "note": "Hook sentence names the core problem or misconception. No heading before this block."
     },
     "h2_sections": {
-      "min": 4,
-      "max": 7,
+      "min": 3,
+      "max": 5,
       "element_sequence": [
         "paragraph:1-3",
         "list:optional — bullet or numbered, at least 3 items when present",
@@ -27,14 +27,14 @@
         "paragraph:1-2",
         "thesis_closer:required — one punchy closing sentence that stands alone"
       ],
-      "image_after_positions": [1, 2, 4],
-      "image_position_note": "Place image placeholders AFTER sections 1, 2, and 4 (not before)."
+      "image_after_positions": [1, 2, 3],
+      "image_position_note": "Place image placeholders AFTER sections 1, 2, and 3 (not before)."
     },
     "faq": {
       "heading": "Frequently Asked Questions",
       "question_format": "**Exact question text ending with a question mark?**",
-      "answer_format": "Answer paragraph. 2-4 sentences. Concrete, scannable.",
-      "count": "4-6",
+      "answer_format": "Answer paragraph. 2-3 sentences. Concrete, scannable.",
+      "count": "3-5",
       "note": "FAQ is always the second-to-last block. Bold format for questions is mandatory."
     },
     "closing": {
@@ -57,15 +57,15 @@
   "validation_rules": {
     "h1_max": 1,
     "h1_note": "Exactly 1 H1 expected in raw generated content. It is stripped before storage.",
-    "h2_min": 4,
-    "h2_max": 8,
+    "h2_min": 3,
+    "h2_max": 5,
     "h3_max": 4,
     "no_empty_headings": true,
     "no_duplicate_headings": true,
     "no_skipped_heading_levels": true,
     "faq_heading_exact_match": "Frequently Asked Questions",
-    "faq_min_questions": 4,
-    "faq_max_questions": 7,
+    "faq_min_questions": 3,
+    "faq_max_questions": 5,
     "image_placeholder_regex": "<!-- SEO_AGENT_IMAGE: [a-z][a-z0-9_-]* -->"
   },
 

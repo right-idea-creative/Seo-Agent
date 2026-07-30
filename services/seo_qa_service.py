@@ -215,8 +215,16 @@ class SEOQAService:
                 f"{article.word_count} words (minimum: 300)",
             ))
 
-        if not re.search(r'\[.+?\]\(.+?\)', article.content_markdown):
-            issues.append(self._issue("no_internal_links"))
+        # Internal-link check requires knowing the site domain to distinguish
+        # internal links from external ones. Skip when domain is unavailable.
+        _site_url = article.request.website_url if article.request else None
+        if _site_url:
+            from urllib.parse import urlparse
+            _domain = urlparse(_site_url).netloc
+            if _domain and not re.search(
+                re.escape(_domain), article.content_markdown
+            ):
+                issues.append(self._issue("no_internal_links"))
 
     def _check_headings(self, content: str, issues: list[SEOIssue]) -> None:
         # Architecture note: article.content_markdown is the body WITHOUT the H1.

@@ -1,12 +1,27 @@
+import fcntl
 import json
 import logging
+from contextlib import contextmanager
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-# Claude Opus 4.8 pricing (per million tokens)
-_CLAUDE_INPUT_PRICE_PER_M = 5.00
-_CLAUDE_OUTPUT_PRICE_PER_M = 10
+# Per-model pricing (USD per million tokens).
+# Keyed by model-name prefix so future minor versions stay correct.
+_MODEL_PRICING: dict[str, tuple[float, float]] = {
+    # prefix              input   output
+    "claude-opus-4":      (5.00,  25.00),
+    "claude-sonnet-4":    (3.00,  15.00),
+    "claude-haiku-4":     (1.00,   5.00),
+}
+_DEFAULT_PRICING: tuple[float, float] = (5.00, 25.00)  # conservative fallback
+
+
+def _model_prices(model: str) -> tuple[float, float]:
+    for prefix, prices in _MODEL_PRICING.items():
+        if model.startswith(prefix):
+            return prices
+    return _DEFAULT_PRICING
 
 # OpenAI gpt-image-1 pricing (1536×1024, quality="high").
 # Token-based: ~6208 output image tokens × $40/1M + ~100 input tokens × $5/1M ≈ $0.25/image.
@@ -76,19 +91,21 @@ class BudgetService:
         data = self._load()
         return round(data["claude"]["usd"] + data["openai"]["usd"], 6)
 
-    def record_claude(self, input_tokens: int, output_tokens: int) -> None:
+    def record_claude(self, input_tokens: int, output_tokens: int, model: str = "") -> None:
         """Record a Claude API call and persist the updated totals."""
+        input_price, output_price = _model_prices(model)
         cost = (
-            input_tokens / 1_000_000 * _CLAUDE_INPUT_PRICE_PER_M
-            + output_tokens / 1_000_000 * _CLAUDE_OUTPUT_PRICE_PER_M
+            input_tokens / 1_000_000 * input_price
+            + output_tokens / 1_000_000 * output_price
         )
-        data = self._load()
-        c = data["claude"]
-        c["calls"] += 1
-        c["input_tokens"] += input_tokens
-        c["output_tokens"] += output_tokens
-        c["usd"] = round(c["usd"] + cost, 6)
-        self._save(data)
+        with self._exclusive_lock():
+            data = self._load()
+            c = data["claude"]
+            c["calls"] += 1
+            c["input_tokens"] += input_tokens
+            c["output_tokens"] += output_tokens
+            c["usd"] = round(c["usd"] + cost, 6)
+            self._save(data)
         logger.debug(
             "Claude recorded: +%d/%d tokens, +$%.4f (total $%.4f)",
             input_tokens, output_tokens, cost, c["usd"],
@@ -97,12 +114,13 @@ class BudgetService:
     def record_openai(self, images: int = 1) -> None:
         """Record OpenAI image generation and persist the updated totals."""
         cost = images * _OPENAI_IMAGE_PRICE
-        data = self._load()
-        o = data["openai"]
-        o["calls"] += 1
-        o["images"] += images
-        o["usd"] = round(o["usd"] + cost, 6)
-        self._save(data)
+        with self._exclusive_lock():
+            data = self._load()
+            o = data["openai"]
+            o["calls"] += 1
+            o["images"] += images
+            o["usd"] = round(o["usd"] + cost, 6)
+            self._save(data)
         logger.debug(
             "OpenAI recorded: +%d image(s), +$%.4f (total $%.4f)",
             images, cost, o["usd"],
@@ -126,6 +144,18 @@ class BudgetService:
         }
 
     # ── Internal ──────────────────────────────────────────────────────────────
+
+    @contextmanager
+    def _exclusive_lock(self):
+        """Acquire an exclusive POSIX file lock for read-modify-write operations."""
+        self._dir.mkdir(parents=True, exist_ok=True)
+        lock_path = self._dir / ".budget.lock"
+        with open(lock_path, "w") as lf:
+            fcntl.flock(lf, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lf, fcntl.LOCK_UN)
 
     def _current_month(self) -> str:
         if self._year_month:

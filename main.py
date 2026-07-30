@@ -145,7 +145,7 @@ def generate(
     service: str | None = typer.Option(None, "--service", "-s", help="Service or product the article supports."),
     city: str | None = typer.Option(None, "--city", help="Target city for local SEO."),
     state: str | None = typer.Option(None, "--state", help="Target state or province (required with --city)."),
-    words: int = typer.Option(settings.default_word_count, "--words", "-w", min=300, max=1000, help="Target word count (700–1000; default 850)."),
+    words: int = typer.Option(settings.default_word_count, "--words", "-w", min=300, max=950, help="Target word count (700–900; default 800, hard cap 950)."),
     tone: ArticleTone = typer.Option(settings.default_tone, "--tone", help="Writing tone."),
     language: ArticleLanguage = typer.Option(ArticleLanguage.EN, "--language", "-l", help="Article language (default: English)."),
     keyword: str | None = typer.Option(None, "--keyword", "-k", help="Primary keyword hint for the agent."),
@@ -325,11 +325,12 @@ def interactive() -> None:
 # ── Private helpers ───────────────────────────────────────────────────────────
 
 def _save_article(article: Article, base_dir: Path) -> Path:
+    safe_slug = re.sub(r'[^a-z0-9-]', '-', article.seo.slug.lower()).strip('-') or "article"
     article_dir = (
         base_dir
         / article.tenant.client_id
         / article.tenant.website_id
-        / article.seo.slug
+        / safe_slug
     )
     article_dir.mkdir(parents=True, exist_ok=True)
     (article_dir / "article.json").write_text(
@@ -437,6 +438,8 @@ def _execute_generation(
                 tenant.client_id, tenant.website_id
             )
             _req_reuse_group = _profile.reuse_group if _profile else None
+            if _req_reuse_group is not None:
+                tenant = tenant.model_copy(update={"reuse_group": _req_reuse_group})
 
             # Pass 1: fast in-memory pool lookup (no filesystem scan)
             pool = DraftPoolService(base_dir)
@@ -473,7 +476,10 @@ def _execute_generation(
                 "tenant": tenant,
                 "request": request,
                 "publishing": PublishingOptions(),
-                "status": PublishStatus.DRAFT,
+                "status": ArticleStatus.REVIEW,
+                "wp_post_id": None,
+                "wp_post_url": None,
+                "drive_document_id": None,
             })
 
             match_label = (
@@ -717,7 +723,12 @@ def _run_publish_flow(
     # Content sanitization — remove UI artifacts before any pipeline stage sees the content
     san_result = ContentSanitizationService().sanitize(article.content_markdown)
     if san_result.changed:
-        article = article.model_copy(update={"content_markdown": san_result.markdown})
+        _san_words = len(san_result.markdown.split())
+        article = article.model_copy(update={
+            "content_markdown": san_result.markdown,
+            "word_count": _san_words,
+            "reading_time_minutes": max(1, _san_words // 200),
+        })
         _display_sanitization(san_result)
 
     # Image resolution (before WP connection — no WP calls needed)
@@ -902,7 +913,12 @@ def _run_publish_flow(
                 posts = wp.list_posts()
                 enriched_md = link_enricher.enrich(article, posts, article.content_markdown)
                 links_added = link_enricher.last_links_added
-                article = article.model_copy(update={"content_markdown": enriched_md})
+                _enrich_words = len(enriched_md.split())
+                article = article.model_copy(update={
+                    "content_markdown": enriched_md,
+                    "word_count": _enrich_words,
+                    "reading_time_minutes": max(1, _enrich_words // 200),
+                })
             except Exception as exc:
                 logger.warning("Link enrichment failed (non-blocking): %s", exc)
 
@@ -1283,6 +1299,7 @@ def _run_dual_qa(
         min_vision_claude=settings.qa_min_vision_claude,
         min_vision_openai=settings.qa_min_vision_openai,
         max_cycles=settings.qa_max_cycles,
+        enable_rescue=settings.qa_rescue_enabled,
     )
 
     try:
@@ -3085,14 +3102,16 @@ def _suggest_topics(
         "Write ideas whose relevance does not expire."
     )
 
+    user_message = "\n".join(context_lines)
     raw = claude.generate(
         system,
-        [{"role": "user", "content": "\n".join(context_lines)}],
+        [{"role": "user", "content": user_message}],
         thinking=False,
         model=settings.topic_model,
         label="topics:suggest",
     )
-    return re.findall(r'^\d+\.\s+(.+)$', raw.strip(), flags=re.MULTILINE)
+    topics = re.findall(r'^\d+\.\s+(.+)$', raw.strip(), flags=re.MULTILINE)
+    return topics, raw, user_message
 
 
 @app.command()
@@ -3121,7 +3140,7 @@ def suggest(
 
     with console.status(f"[bold green]Generating {n} topic ideas...", spinner="dots"):
         try:
-            topics = _suggest_topics(
+            topics, _, _ = _suggest_topics(
                 resolved_client, resolved_website,
                 service=service,
                 city=city,
@@ -3247,7 +3266,7 @@ def autopublish(
     city: str | None = typer.Option(None, "--city", help="Target city for local SEO."),
     state_opt: str | None = typer.Option(None, "--state", help="Target state (required with --city)."),
     keyword: str | None = typer.Option(None, "--keyword", "-k", help="Primary keyword hint for generation."),
-    words: int = typer.Option(settings.default_word_count, "--words", "-w", min=300, max=1000, help="Target word count (700–1000; default 850)."),
+    words: int = typer.Option(settings.default_word_count, "--words", "-w", min=300, max=950, help="Target word count (700–900; default 800, hard cap 950)."),
     language: ArticleLanguage = typer.Option(ArticleLanguage.EN, "--language", "-l", help="Article language (always English)."),
     status: str = typer.Option("draft", "--status", help="WordPress post status: draft or publish."),
     min_score: int = typer.Option(settings.seo_qa_min_score, "--min-score", min=0, max=100, help="Minimum SEO quality score."),
@@ -3293,12 +3312,14 @@ def autopublish(
 
     # Warn (don't fail) if city/state cannot be resolved — resolver will try WP/heuristics
     _profile_city: str | None = None
+    _profile_service: str | None = None
     try:
         from models.site_profile import SiteProfile as _SP
-        _profile_path = settings.profiles_dir / resolved_client / f"{resolved_website}.json"
+        _profile_path = settings.profiles_dir / resolved_client / resolved_website / "site.json"
         if _profile_path.exists():
             _sp = _SP.model_validate_json(_profile_path.read_text(encoding="utf-8"))
             _profile_city = _sp.city or None
+            _profile_service = _sp.primary_service or _sp.niche or None
     except Exception:
         pass
     if not city and not _profile_city:
@@ -3320,12 +3341,17 @@ def autopublish(
     _call_tracer.start()
 
     # ── Step 1: Suggest topics ────────────────────────────────────
+    _TOPIC_PLACEHOLDER_RE = re.compile(
+        r'\[(?:City|Service|Keyword|Topic|TOPIC|Location|Business|State|Country|Name|Date|Year|Niche)\]',
+        re.IGNORECASE,
+    )
+
     with console.status(f"[bold green]Generating {suggest_n} topic ideas...", spinner="dots"):
         try:
-            topics = _suggest_topics(
+            topics, topic_raw, topic_prompt = _suggest_topics(
                 resolved_client, resolved_website,
-                service=service,
-                city=city,
+                service=service or _profile_service,
+                city=city or _profile_city,
                 language=language,
                 n=suggest_n,
                 base_dir=base_dir,
@@ -3336,11 +3362,34 @@ def autopublish(
 
     if not topics:
         console.print("[red]Error:[/red] No topics were generated. Try again.")
+        console.print("\n[dim]── Prompt sent ──[/dim]")
+        console.print(topic_prompt)
+        console.print("\n[dim]── Raw response ──[/dim]")
+        console.print(topic_raw)
         raise typer.Exit(code=1)
 
-    selected_topic = topics[0]
-    console.print(f"[dim]Generated {len(topics)} ideas. Selected:[/dim]")
-    console.print(f"[bold cyan]  {selected_topic}[/bold cyan]")
+    console.print(f"[dim]Generated {len(topics)} topic ideas:[/dim]")
+    selected_topic: str | None = None
+    for i, t in enumerate(topics, 1):
+        has_placeholder = bool(_TOPIC_PLACEHOLDER_RE.search(t))
+        if has_placeholder:
+            console.print(f"  [dim]{i}. [red]INVALID[/red] (placeholder) — {t}[/dim]")
+        else:
+            if selected_topic is None:
+                console.print(f"  {i}. [green]VALID[/green] ← selected — {t}")
+                selected_topic = t
+            else:
+                console.print(f"  {i}. [green]VALID[/green] — {t}")
+
+    if selected_topic is None:
+        console.print("\n[red]Error:[/red] All generated topics contain placeholders. Cannot auto-select.")
+        console.print("\n[dim]── Prompt sent ──[/dim]")
+        console.print(topic_prompt)
+        console.print("\n[dim]── Raw response ──[/dim]")
+        console.print(topic_raw)
+        raise typer.Exit(code=1)
+
+    console.print(f"\n[bold cyan]Selected:[/bold cyan] {selected_topic}")
     console.print()
 
     # ── Step 2: Generate article ──────────────────────────────────

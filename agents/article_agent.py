@@ -45,24 +45,39 @@ HOW TO USE THE REASONING PLAN
 Transform — never copy.
 Every field in the plan is reasoning material, not prose. Rewrite it as natural sentences.
 
+CRITICAL — Do not let the plan's structure show in the prose:
+The plan delivers reasoning under field labels (technical_reality, professional_insight,
+local_factors, etc.). Do NOT write one paragraph per field. Do NOT produce visibly parallel
+blocks that follow the plan's category order. The article's paragraph structure must follow
+narrative logic — cause, then effect; claim, then evidence; rule, then exception — not the
+plan's field sequence. A reader should not be able to reconstruct the plan's categories
+from the prose structure.
+
+Write from observation, not category:
+A 15-year technician describes what they saw, heard, or measured — not which category the
+observation belongs to.
+  WRONG: "The technical reality is that torsion springs hold 300 lbs of tension."
+  RIGHT: "A correctly tensioned torsion spring holds the equivalent of 300 lbs across its
+    coils — that's why an uncontrolled release is a projectile event, not a spring bounce."
+
 Section structure: the plan's section_plans appear in document order. Write them in order.
 Use the heading exactly as given in the plan.
 
-Counter-intuitive facts: reveal them naturally as part of the technical explanation.
-Never announce them with "surprisingly," "interestingly," or "you might be shocked to learn."
+Counter-intuitive facts: reveal them as part of the argument — no announcement.
+Never use "surprisingly," "interestingly," "you might be shocked to learn," or "most people
+don't realize." The fact itself is the reveal.
 
 Why-not examples: write them as — name the approach → state the prohibition → explain the
 exact mechanical reason. This is the strongest authenticity signal in the plan.
-Every why-not in the plan must appear in the article.
+Include the most relevant ones — those that directly support the article's main argument.
 
-Specific numbers: every quantitative fact in the plan's specific_numbers lists MUST appear
-in the article. These are the plan's primary authenticity anchors.
+Specific numbers: include the most impactful quantitative facts. Numbers that support the
+argument and fit naturally. Do not insert all of them if it pushes past 900 words.
 
 Local factors: embed them into technical arguments, never as standalone regional trivia.
 "In a freeze-thaw climate, silicone resists grit accumulation better than WD-40" is correct
 because it grounds the recommendation in a mechanical reason. "{resolved_city} has cold winters"
-is not — that's a city mention, not local grounding. The city from TARGET LOCATION should
-change the technical argument, not just appear as a name drop.
+is not — that's a city mention, not local grounding.
 
 Realistic limitations: acknowledge them honestly. Expert credibility comes from acknowledging
 what can go wrong, not from promising perfect outcomes.
@@ -85,15 +100,55 @@ Editorial elements (use when they add genuine value):
 • Bullet or numbered lists for steps, tips, or comparisons (3+ items)
 • A simple Markdown table when comparing options, costs, or features
 • A callout block (> ⚠️ **Important:** ...) for critical safety notes or warnings
-• A FAQ section (## FAQ or ## Frequently Asked Questions) near the end with 5 Q&A pairs
+• A FAQ section (## FAQ or ## Frequently Asked Questions) near the end with 3–4 Q&A pairs
 
-Prose quality:
-• Vary sentence length deliberately: short punchy sentences (8–10 words) mixed with
-  longer explanatory ones (25–35 words)
-• At least one standalone single-sentence paragraph used for emphasis
-• Start some sentences with "And" or "But" where it flows naturally
-• Use contractions throughout: "you'll", "it's", "don't", "we've", "that's"
-• Deliberately mix two-sentence paragraphs with longer ones
+VOICE AND PERSPECTIVE:
+Write as if explaining the topic to an experienced homeowner standing next to the garage door.
+They have owned the house for ten years. They know what a spring is. They want to understand
+what is actually happening — not be sold something, and not be talked down to.
+
+PARAGRAPH FLOW — alternate naturally between these modes within and across sections:
+  Observation:           what you see, hear, or measure on the component
+    "The coil loses tension incrementally, which is why the door hesitates going up
+    before it ever refuses to move."
+  Explanation:           why it happens — the mechanical cause
+    "Spring steel fatigues because each cycle flexes the metal against its grain —
+    10,000 cycles is the design limit, not a suggestion."
+  Consequence:           what goes wrong if the reader acts on the wrong assumption
+    "That extra strain falls entirely on the opener motor — not the spring."
+  Practical implication: what this means for the homeowner's decision
+    "Watch for hesitation in the first six inches of upward travel — that's the
+    diagnostic window before a spring reaches failure."
+  Example:               a specific scenario that makes the abstract concrete
+  Warning:               what must not be done and exactly why
+    "Lubricating springs actually shortens their life by attracting grit that
+    scores the coil surface with every cycle."
+
+PARAGRAPH OPENERS — rotate through these naturally:
+  — Observation:      "A correctly tensioned torsion spring holds 300 lbs before the door moves."
+  — Condition:        "When the temperature drops below 20°F, the steel contracts..."
+  — Question:         "Why does the door hesitate going up but not coming down?"
+  — Consequence:      "That extra strain falls entirely on the opener motor."
+  — Local situation:  "Northwest Indiana's freeze-thaw cycles create a different failure pattern..."
+  — Action:           "Disconnect the opener and lift the door by hand to test the balance."
+
+Do not repeatedly introduce the subject at paragraph openings.
+"The spring..." / "The door..." / "The opener..." paragraph after paragraph flattens the
+reading experience. The subject changes when the logic demands it, not on a schedule.
+
+SENTENCE RHYTHM:
+Vary sentence rhythm naturally. Some ideas deserve a short sentence. Others should be
+developed in longer sentences that trace a mechanism from cause to effect.
+
+A short sentence after a long one lands the key point:
+  "A correctly-tensioned torsion spring stores about 300 lbs of force across its coils
+  before the door moves an inch. That force doesn't disappear when a spring breaks —
+  it has to go somewhere."
+
+Do not consciously optimize for sentence statistics. Optimize for readability.
+
+Use contractions throughout: "you'll", "it's", "don't", "we've", "that's"
+Start some sentences with "And" or "But" where it flows naturally.
 
 BANNED TRANSITIONS — must never appear anywhere in the output:
   Furthermore, Moreover, Additionally, In addition, In conclusion, It's worth noting,
@@ -222,7 +277,7 @@ A title, heading, sentence, or keyword phrase containing [City], [Service],
 # models/article.py:SEOMetadata.
 _SEO_LENGTH_LIMITS: dict[str, int] = {
     "seo_title": 70,
-    "meta_description": 170,
+    "meta_description": 160,
 }
 
 
@@ -420,10 +475,16 @@ class ArticleAgent:
         plan: ArticlePlan | None = None,
     ) -> str:
         thinking_value = plan is None
+        # 2 000 tokens handles the worst-case planned article: ~950 words × 1.5 tokens/word
+        # for Markdown-heavy prose (headings, bold, image tags, FAQ pairs) ≈ 1 425 tokens,
+        # plus ~200 tokens of structural markup, leaving ~375 tokens of headroom.
+        # When plan is provided, thinking=False so all tokens are prose output.
+        # When no plan, thinking=True uses ~400 tokens internally, leaving ~1600 for output (~1 100 words).
         messages = [{"role": "user", "content": self._build_generator_prompt(request, plan)}]
         return self._service.generate(
             _GENERATOR_SYSTEM, messages,
             thinking=thinking_value,
+            max_tokens=2000,
             label="generate:article",
         )
 
@@ -437,7 +498,13 @@ class ArticleAgent:
         if plan is not None:
             parts += [plan.to_generator_block(), ""]
 
-        parts.append(f"Write a {request.word_count}-word article about: {request.topic}")
+        parts.append(
+            f"Article topic: {request.topic}\n"
+            f"TARGET WORD COUNT: {request.word_count} words — minimum 700, ideal 800, maximum 900.\n"
+            "HARD CAP: Never exceed 950 words under any circumstances. "
+            "Stop adding content when you approach 900 words. "
+            "Do not pad to reach the target — a tight 750-word article is better than a padded 1000-word one."
+        )
 
         if request.service:
             parts.append(f"Service: {request.service}")
@@ -461,10 +528,16 @@ class ArticleAgent:
             parts += [
                 f"Primary keyword to target: {request.focus_keyword}",
                 (
-                    "Keyword placement — distribute naturally, never force or repeat mechanically:\n"
-                    "  - H1 title: include the keyword or a close natural variant\n"
-                    "  - Introduction: mention the keyword in the first paragraph\n"
-                    "  - Body: use it in at least one H2 heading when it fits the topic\n"
+                    "Keyword placement — non-negotiable rules:\n"
+                    f"  - H1 title: MUST contain the exact phrase '{request.focus_keyword}' verbatim.\n"
+                    "    The keyword may appear anywhere in the H1 but must be present exactly as written.\n"
+                    "    CORRECT: '# Garage Door Spring Replacement in Northwest Indiana: What to Know'\n"
+                    "    WRONG:   '# Spring Replacement Signs and Costs in Northwest Indiana'  ← keyword split\n"
+                    "  - Introduction: the keyword MUST appear within the first 100 words — count strictly from word 1\n"
+                    "  - H2 headings: AT LEAST ONE H2 must contain the focus keyword or a close variant\n"
+                    "    (close variant = 3+ consecutive words of the keyword appear in the H2).\n"
+                    "    This is mandatory — do not skip it because 'it doesn't fit'.\n"
+                    "    STRATEGY: the cost or timing section H2 almost always accommodates this naturally.\n"
                     "  - Conclusion: use it once in the closing paragraph\n"
                     "  - FAQ (when included): weave it into at least one question or answer\n"
                     "  - Target density: 1–2% of total words — never exceed 2% or repeat "
@@ -480,16 +553,21 @@ class ArticleAgent:
         if plan is None:
             parts += [
                 "",
-                "External links: add 1–2 external links to authoritative, non-competing sources "
-                "(government agencies, manufacturer websites, industry associations, safety standards). "
-                "Use natural anchor text — never 'click here'. Omit if no truly relevant source exists.",
+                "External links — REQUIRED (not optional):\n"
+                "Include AT LEAST ONE external link to an authoritative, non-competing source.\n"
+                "Acceptable sources: government agencies (CPSC, OSHA, DOE, DASMA), "
+                "manufacturer associations, safety standards, university extensions.\n"
+                "Use natural anchor text — never 'click here'.\n"
+                "An article with zero external links will fail quality review.",
             ]
         else:
             parts += [
                 "",
-                "External links: cite the authority sources listed in the plan where they fit. "
-                "Add up to 2 additional authoritative links if relevant. "
-                "Use natural anchor text — never 'click here'.",
+                "External links — REQUIRED (not optional):\n"
+                "Include AT LEAST ONE external link. Prefer authority sources from the plan.\n"
+                "If the plan lists sources, cite the most relevant one with natural anchor text.\n"
+                "Add a second link if a second authoritative source fits naturally.\n"
+                "An article with zero external links will fail quality review.",
             ]
 
         # ── Structural scaffold (from templates/article_structure.json) ────────
@@ -547,6 +625,7 @@ class ArticleAgent:
                     input_schema=schema,
                     model=settings.seo_model,
                     label="seo:metadata",
+                    thinking=False,
                 )
                 return SEOMetadata(**raw)
             except ValidationError as exc:
@@ -648,8 +727,6 @@ class ArticleAgent:
                 )
                 time.sleep(wait)
 
-        raise ClaudeRateLimitError("SEO generation failed after 3 attempts.")
-
     def _build_seo_messages(self, request: ArticleRequest, content: str) -> list[dict[str, Any]]:
         hints: list[str] = [f"Topic: {request.topic}"]
         if request.focus_keyword:
@@ -663,6 +740,21 @@ class ArticleAgent:
         prompt = (
             "Based on the article below, generate complete and accurate SEO metadata "
             "optimized for local search.\n\n"
+            "SEO TITLE RULE (mandatory): The seo_title field MUST contain the exact focus keyword "
+            "or a very close natural variant of it. The keyword hint is provided below — do not "
+            "omit it from the title. A title without the keyword will fail QA.\n\n"
+            "META DESCRIPTION RULE (mandatory): Write 130–150 characters. "
+            "The field is hard-capped at 160 — anything longer is truncated at a word boundary, "
+            "which produces an incomplete sentence. Stay well below 160. "
+            "A meta description under 120 characters is too short to be competitive. "
+            "Target 130–150 characters as the safe range.\n\n"
+            "SLUG RULE (mandatory): Use 4–6 meaningful words, hyphen-separated. "
+            "Include the primary service term and city/region. Omit filler words: "
+            "'and', 'or', 'the', 'in', 'for', 'a', 'an', 'to', 'of'. "
+            "Maximum 55 characters total. A shorter slug that includes service + location "
+            "is better than a longer one. "
+            "GOOD: 'garage-door-spring-replacement-northwest-indiana'. "
+            "BAD: 'complete-guide-to-garage-door-spring-replacement-signs-and-costs-in-northwest-indiana'.\n\n"
             "Evergreen rule: do NOT include specific years (2024, 2025, 2026, etc.) in the "
             "seo_title, slug, or focus_keyword unless the article topic is explicitly "
             "year-dependent. Prefer timeless titles: 'Complete Guide', 'What Homeowners "
