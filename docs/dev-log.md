@@ -94,3 +94,15 @@ Also performed a forensic investigation proving that draft reuse correctly rejec
 3. **Resolve Jaccard/normalization asymmetry**: Either apply `_SYNONYMS` in `draft_pool_service._tokenize()`, or strip the duplicate forms from `req_tokens` before scoring.
 4. **Integrate `writing_audit_service.py`** into the QA pipeline.
 5. **Run the test suite against the current codebase** and fix any failures introduced by today's schema changes (`SectionPlan` field removals).
+
+---
+
+### Session Close — 2026-07-30
+
+**Documentation added this session:** `docs/dev-log.md`, `CHANGELOG.md`, `PROJECT_STATUS.md`, `README.md` (rewritten to reflect current capabilities). `PROJECT_MEMORY.md` created at project root.
+
+**Command infrastructure:** `.claude/commands/end.md` populated from nested source. `claude/claude/PROJECT_MEMORY.md` (empty, misplaced) removed from untracked state.
+
+**Commits:** `650bbeb` (engineering audit), `4867a78` (PROJECT_STATUS + README), `chore:` (command infrastructure + project memory).
+
+---

@@ -78,3 +78,5 @@ Then B2: add `budget.record_openai_text()` calls in `openai_review_service.py`.
 - **OpenAI text cost not tracked** (see B2 above)
 - **`writing_audit_service.py` not integrated**: File exists in `services/` but is not called from any pipeline stage.
 - **`benchmark_results.jsonl` committed**: Raw benchmark output; should be `.gitignore`d if re-run frequently.
+- **`dual_qa_agent.py` is ~1700 lines**: Monolithic — revision, rescue, vision QA, cost tracking, and format helpers should be split into sub-modules.
+- **No CI/CD**: Tests are present but not automatically run on push. GitHub Actions needed.
