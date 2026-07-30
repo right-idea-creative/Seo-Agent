@@ -1,6 +1,6 @@
 # SEO Agent — Project Status
 
-_Last updated: 2026-07-30_
+_Last updated: 2026-07-30 (Session 2)_
 
 ---
 
@@ -34,6 +34,8 @@ Sprint outcome: 20+ bug fixes, 9 tests added, multi-model budget pricing, word c
 - Autopublish topic placeholder detection — rejects `[City]`, `[Service]`, etc.
 - `reuse_group` wired from site profile → tenant context (cross-site reuse now functional)
 - Slug path traversal fix, WP field clearing on reuse, word_count consistency fixes
+- Claude command files (`start.md`, `end.md`, `review.md`) versioned under `.claude/commands/`
+- `.gitignore` narrowed to `/.claude/settings.local.json` (commands now tracked)
 
 ---
 

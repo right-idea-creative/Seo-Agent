@@ -106,3 +106,66 @@ Also performed a forensic investigation proving that draft reuse correctly rejec
 **Commits:** `650bbeb` (engineering audit), `4867a78` (PROJECT_STATUS + README), `chore:` (command infrastructure + project memory).
 
 ---
+
+## 2026-07-30 (Session 2)
+
+### Summary
+
+Short session focused entirely on repository structure and tooling. No production code was modified.
+
+Executed the `claude start` session briefing workflow, which produced a complete project health report and a prioritized work plan. Then investigated the `claude/claude/` directory anomaly, diagnosed it as a failed gitignore workaround, and performed a clean consolidation of all Claude command files into the correct versioned location.
+
+---
+
+### Features Added
+
+None.
+
+---
+
+### Improvements
+
+- All three Claude commands (`start.md`, `end.md`, `review.md`) are now committed to version control and will be available across all future sessions without manual reconstruction.
+
+---
+
+### Fixes
+
+- **`.gitignore` rule too broad**: `.claude/` → `/.claude/settings.local.json`. The old rule gitignored any `.claude/` directory anywhere in the tree. Command files were unversioned despite being project artifacts, not local config.
+- **Zero-byte `claude/claude/commands` file**: Accidentally committed in a prior session. Removed via `git rm`.
+- **`review.md` missing from root `.claude/commands/`**: Only existed in the now-deleted `claude/claude/.claude/commands/` path. `claude review` was silently broken. Moved to canonical location.
+
+---
+
+### Refactors
+
+None.
+
+---
+
+### Documentation
+
+None. (Session briefing was analysis output, not a documentation artifact.)
+
+---
+
+### Challenges
+
+The `.gitignore` rule `.claude/` (without a leading `/`) applies recursively to every `.claude/` directory in the repository tree. The `claude/claude/.claude/` workaround path was therefore also gitignored, making the workaround completely ineffective. Diagnosis required reading git internals behavior for pattern anchoring.
+
+---
+
+### Lessons Learned
+
+- Gitignore patterns without a leading `/` are applied recursively. To restrict a rule to the repository root, always anchor with `/`.
+- Claude Code command files are project assets, not developer-local config. They belong in version control under `.claude/commands/`, with only credentials and local settings gitignored.
+
+---
+
+### Next Steps
+
+1. Fix B1: `agents/dual_qa_agent.py:555` — `'_budget'` → `'budget'` (one-character fix).
+2. Fix B2: `services/openai_review_service.py` — add `budget.record_openai()` calls after each GPT-4o-mini request.
+3. Run `pytest tests/` to establish baseline before any code changes.
+
+---

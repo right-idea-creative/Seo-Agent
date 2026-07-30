@@ -70,3 +70,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - **`ArticleRequest.language` default**: ES → EN.
 - **`--words` max**: 1000 → 950 in both `generate` and `autopublish` commands.
 - **`openai_approved` reference before assignment** when OpenAI reviewer is None (`agents/dual_qa_agent.py`).
+- **`.gitignore` excluded command files**: Rule `.claude/` applied recursively, preventing `.claude/commands/` from being versioned. Narrowed to `/.claude/settings.local.json`.
+- **`review.md` missing from canonical command location**: `claude review` was silently broken. Moved to `.claude/commands/`.
+- **Zero-byte `claude/claude/commands` file**: Accidentally committed artifact removed via `git rm`.
+
+### Chore
+
+- **Claude command consolidation**: All three session commands (`start.md`, `end.md`, `review.md`) are now committed under `.claude/commands/` and version-controlled. Obsolete `claude/claude/` workaround directory removed.
