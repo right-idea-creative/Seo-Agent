@@ -113,3 +113,12 @@ budget_svc = getattr(self._claude, 'budget', None)
 
 ### B2 — OpenAI text review costs not tracked
 `openai_review_service.py` never calls `budget.record_openai()`. GPT-4o-mini article and image text reviews are invisible to all cost tracking systems.
+
+---
+
+## Tooling Decisions
+
+### Claude command files belong in version control
+`.claude/commands/` contains session workflow definitions (`start.md`, `end.md`, `review.md`). These are project assets, not developer-local configuration. The `.gitignore` rule must be `/.claude/settings.local.json` (anchored, file-specific) — never `.claude/` (recursive, would gitignore the entire commands directory).
+
+**Do not revert this rule.** A `.claude/` gitignore pattern applies to any directory named `.claude/` anywhere in the repository tree, not just the root.
