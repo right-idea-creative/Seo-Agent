@@ -32,7 +32,7 @@ __pycache__/
 *.swo
 
 # Claude
-.claude/
+/.claude/settings.local.json
 
 # Logs
 *.log
