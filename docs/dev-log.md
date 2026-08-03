@@ -2,6 +2,92 @@
 
 ---
 
+## 2026-08-03
+
+### Summary
+
+Implemented Anthropic prompt caching across the five highest-value Claude call sites (Request 2 of the implementation roadmap). No prompts were changed, no models were changed, and no behavior was changed — the only effect is lower input cost on cache hits. Also extended `BudgetService.record_claude()` to correctly account for cache token pricing tiers so monthly cost tracking stays accurate.
+
+---
+
+### Investigation
+
+Audited all 18 Claude API call sites across the codebase. Applied two filters:
+
+1. **Static system prompt**: dynamic content must be entirely in user messages (all 18 qualify).
+2. **Above minimum token threshold**: Sonnet requires ≥1,024 tokens; Haiku requires ≥2,048 tokens.
+
+Result: 13 Haiku calls and 3 short Sonnet calls are not cacheable. The 5 remaining Sonnet calls have large static system prompts and are the only targets.
+
+| Call site | Constant | Estimated tokens | Model |
+|---|---|---|---|
+| `services/article_planner_service.py:547` | `_PLANNER_SYSTEM` | ~2,950 | Sonnet |
+| `services/authenticity_revision_service.py:259` | `_AUTHENTICITY_REWRITE_SYSTEM` | ~2,600 | Sonnet |
+| `agents/article_agent.py:485` | `_GENERATOR_SYSTEM` | ~2,500 | Sonnet |
+| `agents/dual_qa_agent.py:882` | `_REVISION_SYSTEM` | ~1,500 | Sonnet |
+| `agents/dual_qa_agent.py:769` | `_CLAUDE_SEO_SYSTEM` | ~1,400 | Sonnet |
+
+---
+
+### Implementation
+
+**Architecture**: Added a `cache_system: bool = False` keyword argument to `ClaudeService.generate()`, `ClaudeService.generate_structured()`, and their `_base_kwargs()` assembly point. When `True`, `_base_kwargs()` converts `"system": system_str` to `"system": [{"type": "text", "text": system_str, "cache_control": {"type": "ephemeral"}}]` — the Anthropic API accepts `system` as either a plain string or a list of content blocks with optional `cache_control`. `LLMGateway.generate()` and `LLMGateway.generate_structured()` thread the flag through to the primary provider; the fallback (OpenAI) ignores it.
+
+**Budget accounting**: Extended `BudgetService.record_claude()` with `cache_creation_tokens: int = 0` and `cache_read_tokens: int = 0`. Cache write is charged at 1.25× the normal input rate; cache read at 0.10× (90% discount). Existing budget files without these fields are migrated transparently via `setdefault` on first write. `_empty()` now initialises both fields to 0 for new files.
+
+---
+
+### Files Modified
+
+| File | Change |
+|---|---|
+| `services/budget_service.py` | `record_claude()` accepts cache token counts; corrected cost formula; `_empty()` adds `cache_creation_tokens` and `cache_read_tokens` fields |
+| `services/claude_service.py` | `generate()`, `generate_structured()`, `_base_kwargs()` accept `cache_system`; both generation methods pass `cache_creation_input_tokens` / `cache_read_input_tokens` from usage to `record_claude()` |
+| `services/llm_gateway.py` | `generate()` and `generate_structured()` accept and forward `cache_system` to primary |
+| `services/article_planner_service.py` | `cache_system=True` on `_PLANNER_SYSTEM` call |
+| `services/authenticity_revision_service.py` | `cache_system=True` on `_AUTHENTICITY_REWRITE_SYSTEM` call |
+| `agents/article_agent.py` | `cache_system=True` on `_GENERATOR_SYSTEM` call |
+| `agents/dual_qa_agent.py` | `cache_system=True` on `_CLAUDE_SEO_SYSTEM` and `_REVISION_SYSTEM` calls |
+| `tests/test_prompt_caching.py` | 16 new regression tests (see Testing) |
+
+---
+
+### Benchmark (Estimated Savings)
+
+Pricing: Sonnet 4.6 — $3.00/1M input (uncached), $3.75/1M (cache write, 1.25×), $0.30/1M (cache read, 0.10×).
+
+| Call | System tokens | Per-article saving (after first call) |
+|---|---|---|
+| `_GENERATOR_SYSTEM` | ~2,500 | 2,500 × ($3.00 − $0.30) / 1M = **$0.00675** |
+| `_PLANNER_SYSTEM` | ~2,950 | 2,950 × $2.70 / 1M = **$0.00797** |
+| `_AUTHENTICITY_REWRITE_SYSTEM` | ~2,600 | 2,600 × $2.70 / 1M = **$0.00702** (only on rescue) |
+| `_CLAUDE_SEO_SYSTEM` | ~1,400 | 1,400 × $2.70 / 1M = **$0.00378** (per QA cycle) |
+| `_REVISION_SYSTEM` | ~1,500 | 1,500 × $2.70 / 1M = **$0.00405** (per revision) |
+
+For a typical article (generation + planning + 1 QA cycle, no rescue): **~$0.018 saving per article**. At 50 articles/month: **~$0.90/month**. Cache write surcharge on the first call of each batch is small (~$0.00024 per prompt per cold start). The 5-minute TTL means any production batch of multiple articles within the same session will see cache hits on calls 2+.
+
+---
+
+### Testing
+
+16 new tests in `tests/test_prompt_caching.py`:
+
+- **`TestBaseKwargsCacheSystem`** (4 tests): verifies `_base_kwargs()` output with `cache_system=False` (plain string), `cache_system=True` (list with `cache_control`), default behavior, and full prompt preservation.
+- **`TestBudgetCacheAccounting`** (7 tests): verifies cache creation at 1.25×, cache read at 0.10×, uncached unchanged, mixed cost formula, counter accumulation, backward compatibility with legacy budget files, zero-token no-op.
+- **`TestCacheSitesPassFlag`** (5 tests): one per call site — confirms `cache_system=True` reaches `generate` / `generate_structured` from each of the five callers.
+
+Full suite: **81 tests, 81 passed**.
+
+---
+
+### Risks and Rollback
+
+**Risk**: Anthropic's caching minimum (1,024 tokens for Sonnet) is met by all 5 prompts. If a prompt is shortened below the threshold in future, the cache header will be ignored silently — no error, just no saving.
+
+**Rollback**: Remove the five `cache_system=True` keyword arguments from the call sites. The `cache_system` flag defaults to `False`, so removing the arguments restores the exact previous behavior. No data migration needed.
+
+---
+
 ## 2026-07-30
 
 ### Summary
@@ -259,5 +345,135 @@ New tests cover:
 ### Next Steps
 
 None — B1 and B2 are closed. No open critical bugs remain.
+
+---
+
+## Request 2 Post-Mortem: Prompt Caching Removed
+
+**Date:** 2026-08-03  
+**Engineer:** Claude (automated)  
+**Decision:** Remove Anthropic Prompt Caching — net-negative under current architecture.
+
+---
+
+### Background
+
+Request 2 added Anthropic Prompt Caching to five call sites across the article pipeline. The implementation used a `cache_system: bool = False` flag threaded from the gateway layer down to `ClaudeService._base_kwargs()`, which conditionally converted the system prompt string into an `[{"type": "text", "text": ..., "cache_control": {"type": "ephemeral"}}]` list when the flag was set. Cache creation and read token counts were tracked in `BudgetService` and `CallTracer`.
+
+---
+
+### Production Measurement
+
+A real `autopublish` run was executed with caching active. Anthropic API usage fields confirmed:
+
+| Stage | cache_creation_tokens | cache_read_tokens | input_tokens |
+|---|---|---|---|
+| plan:article | > 0 | 0 | normal |
+| generate:article | > 0 | 0 | normal |
+| qa:claude | > 0 | 0 | normal |
+| qa:revision | > 0 | 0 | normal |
+| All other stages | 0 | 0 | normal |
+
+Every stage created a new cache entry. No stage read from any prior cache entry.
+
+---
+
+### Root Cause Analysis: Why Cache Reads Never Occur
+
+**Within a single article run:** The pipeline is a strict sequential dependency chain — plan → generate → QA review → revise → re-review. Each stage consumes the previous stage's output. No stage repeats with the same system prompt and user content combination. There is no opportunity for a same-run cache hit.
+
+**Across article runs:** Anthropic's cache TTL is 5 minutes from write time, not from last access. A planning call at T≈3s writes a cache entry expiring at T≈303s. The full article pipeline runs for ≈170–250 seconds. A second article's planning call would need to arrive before T≈303s — within ≈50 seconds of the first article's planning call — to get a cache read. In practice, `autopublish` is invoked manually, one article at a time, with gaps of hours or days between runs. The TTL window never closes.
+
+**Architecture conclusion:** The current one-article-per-process architecture structurally prevents all cache reads. The only way to exploit prompt caching in this system would be to run N articles in rapid succession (a batch mode that does not exist) or to implement a long-lived daemon that pre-warms the cache and immediately starts the next article. Neither applies.
+
+---
+
+### Cost Impact of Caching
+
+Anthropic prompt caching pricing: write = 1.25× input rate; read = 0.10× input rate.
+
+With zero cache reads, each `cache_creation_tokens` token costs **1.25× the standard input rate** — a 25% surcharge for zero return. Measured per-article:
+
+- cache_creation_tokens: ~22,000 tokens
+- Surcharge at claude-sonnet-4-6 ($3.00/M): +$0.0069 per article
+- Cache reads: $0.00 (none occurred)
+- Net effect: −$0.0069 per article (strictly negative)
+
+**Projected yearly cost at current pace (estimated 2 articles/week):**
+22,000 × 1.25 × $3/M × 0.25 (surcharge factor) × 104 articles/year ≈ **$0.72/year wasted**. Low absolute dollar amount, but 100% waste with no offsetting benefit.
+
+---
+
+### Batch API (Request 3) Viability
+
+Request 3 (Anthropic Batch API) remains architecturally sound and is unaffected by this decision. The Batch API operates at the article level (N whole articles submitted as a batch), not at the call level. Each article's internal pipeline is still sequential; batching only parallelizes articles across submissions. The 50% cost discount on batch-submitted requests applies directly to the same Sonnet + Haiku call mix used today. Request 3 would require a new `batch-autopublish` command with no changes to the existing `autopublish` flow. It is the correct next cost optimization to pursue.
+
+---
+
+### Revert Implementation
+
+All Request 2 changes removed. Files modified:
+
+| File | Change |
+|---|---|
+| `services/claude_service.py` | Removed `cache_system` param from `generate()`, `generate_structured()`, `_base_kwargs()`; removed cache token fields from `record_claude()` and `call_tracer.record()` calls |
+| `services/budget_service.py` | Removed `cache_creation_tokens`/`cache_read_tokens` from `record_claude()` signature and cost formula; removed from `_empty()` |
+| `services/llm_gateway.py` | Removed `cache_system=False` from `generate()` and `generate_structured()` signatures; removed `cache_system=cache_system` from primary lambda calls |
+| `services/article_planner_service.py:546` | Removed `cache_system=True` |
+| `services/authenticity_revision_service.py:263` | Removed `cache_system=True` |
+| `agents/article_agent.py:488` | Removed `cache_system=True` |
+| `agents/dual_qa_agent.py:774` | Removed `cache_system=True` |
+| `agents/dual_qa_agent.py:889` | Removed `cache_system=True` |
+| `tests/test_prompt_caching.py` | Deleted (entire file, 16 tests) |
+
+**Retained (not reverted):**
+
+- `services/call_tracer.py` — Cache↑/Cache↓ columns retained. They display `-` when no caching is active. Pure observability; no behavior change. If a future batch or caching implementation is added, the instrumentation is already in place.
+- `main.py` — Added tracer print inside `DualQAFailedError` handler. This was a bug fix (tracer was silently discarded on QA failure) unrelated to caching.
+
+---
+
+### Test Results
+
+```
+65 passed in 2.95s
+```
+
+65 tests = original 54 (pre-Request-2) + 11 QA cost attribution tests (Request 1-B). The 16 Request-2-specific tests in `test_prompt_caching.py` were deleted with the implementation.
+
+---
+
+### Post-Revert Cost Measurement
+
+Real `autopublish --status draft --no-image` run after revert:
+
+```
+Stage        Model           In Tok   Cache↑   Cache↓   Out Tok   Cost      Time
+plan:ar…     claude-sonnet   5,119    -        -        5,000     $0.0904   115.8s
+generat…     claude-sonnet   8,752    -        -        2,000     $0.0563   58.2s
+qa:clau…     claude-sonnet   4,325    -        -        2,606     $0.0521   54.0s
+seo:met…     claude-haiku    4,229    -        -        303       $0.0057   3.1s
+topics:…     claude-haiku    290      -        -        204       $0.0013   2.9s
+openai:…     gpt-4o-mini     3,032    -        -        474       $0.0007   12.0s
+TOTAL (6 calls)              25,747   -        -        10,587    $0.2065   246.0s
+
+Claude cost:  $0.152357
+```
+
+Cache columns are all `-`. Cache pricing has been entirely removed from the cost calculation. Standard per-token pricing applies throughout.
+
+Note: This run failed QA (article truncated due to token limit — unrelated to caching). The per-call costs are structurally identical to a successful run at similar token volumes.
+
+---
+
+### Final Recommendation
+
+Do not re-introduce prompt caching unless the architecture changes to include one or more of:
+
+1. A batch mode that runs N ≥ 2 articles in the same process within a 5-minute window with shared system prompts.
+2. A long-lived worker/daemon that accepts queued article requests and keeps processes alive long enough for the cache TTL to overlap across runs.
+3. A fundamentally different pipeline design where a system prompt is reused across multiple LLM calls within a single article run (e.g., a multi-turn conversation architecture).
+
+None of these are planned. Under the current architecture, caching is net-negative.
 
 ---

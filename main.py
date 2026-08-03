@@ -1332,6 +1332,10 @@ def _run_dual_qa(
         report = exc.report
         _save_qa_report(article_path, report)
         _display_qa_failure(report, article_path)
+        import services.call_tracer as _ct
+        _ct_inst = _ct.get()
+        if _ct_inst and _ct_inst.records:
+            console.print(_ct_inst.summary())
         raise typer.Exit(code=1)
 
 

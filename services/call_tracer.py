@@ -39,6 +39,8 @@ class CallRecord:
     stage: str
     model: str
     input_tokens: int = 0
+    cache_creation_tokens: int = 0
+    cache_read_tokens: int = 0
     output_tokens: int = 0
     duration_s: float = 0.0
     used: bool = True  # False when output was discarded (e.g. failed revision SEO)
@@ -48,6 +50,8 @@ class CallRecord:
         in_p, out_p = _PRICING.get(self.model, (5.00, 25.00))
         return (
             self.input_tokens / 1_000_000 * in_p
+            + self.cache_creation_tokens / 1_000_000 * in_p * 1.25
+            + self.cache_read_tokens / 1_000_000 * in_p * 0.10
             + self.output_tokens / 1_000_000 * out_p
         )
 
@@ -64,12 +68,16 @@ class CallTracer:
         input_tokens: int,
         output_tokens: int,
         duration_s: float,
+        cache_creation_tokens: int = 0,
+        cache_read_tokens: int = 0,
         used: bool = True,
     ) -> None:
         self.records.append(CallRecord(
             stage=stage,
             model=model,
             input_tokens=input_tokens,
+            cache_creation_tokens=cache_creation_tokens,
+            cache_read_tokens=cache_read_tokens,
             output_tokens=output_tokens,
             duration_s=duration_s,
             used=used,
@@ -86,7 +94,7 @@ class CallTracer:
         from rich.table import Table
 
         table = Table(
-            "Stage", "Model", "In Tok", "Out Tok", "Cost", "Time",
+            "Stage", "Model", "In Tok", "Cache↑", "Cache↓", "Out Tok", "Cost", "Time",
             box=rich_box.SIMPLE,
             show_header=True,
             header_style="bold dim",
@@ -96,21 +104,29 @@ class CallTracer:
         sorted_records = sorted(self.records, key=lambda r: r.cost_usd, reverse=True)
         for r in sorted_records:
             warn = " [yellow]¬used[/yellow]" if not r.used else ""
+            cache_create = f"[yellow]{r.cache_creation_tokens:,}[/yellow]" if r.cache_creation_tokens else "-"
+            cache_read   = f"[green]{r.cache_read_tokens:,}[/green]"       if r.cache_read_tokens   else "-"
             table.add_row(
                 r.stage + warn,
                 r.model,
                 f"{r.input_tokens:,}",
+                cache_create,
+                cache_read,
                 f"{r.output_tokens:,}",
                 f"${r.cost_usd:.4f}",
                 f"{r.duration_s:.1f}s",
             )
 
-        total_in  = sum(r.input_tokens  for r in self.records)
-        total_out = sum(r.output_tokens for r in self.records)
-        total_dur = sum(r.duration_s    for r in self.records)
+        total_in     = sum(r.input_tokens          for r in self.records)
+        total_create = sum(r.cache_creation_tokens for r in self.records)
+        total_read   = sum(r.cache_read_tokens     for r in self.records)
+        total_out    = sum(r.output_tokens         for r in self.records)
+        total_dur    = sum(r.duration_s            for r in self.records)
         table.add_row(
             f"[bold]TOTAL ({len(self.records)} calls)[/bold]", "",
             f"[bold]{total_in:,}[/bold]",
+            f"[bold yellow]{total_create:,}[/bold yellow]" if total_create else "[bold]-[/bold]",
+            f"[bold green]{total_read:,}[/bold green]"     if total_read   else "[bold]-[/bold]",
             f"[bold]{total_out:,}[/bold]",
             f"[bold cyan]${self.total_cost():.4f}[/bold cyan]",
             f"[bold]{total_dur:.1f}s[/bold]",
@@ -145,6 +161,8 @@ def record(
     input_tokens: int,
     output_tokens: int,
     duration_s: float,
+    cache_creation_tokens: int = 0,
+    cache_read_tokens: int = 0,
     used: bool = True,
 ) -> None:
     """Record a call to the active tracer. No-op if no tracer is active."""
@@ -153,6 +171,8 @@ def record(
             stage=stage,
             model=model,
             input_tokens=input_tokens,
+            cache_creation_tokens=cache_creation_tokens,
+            cache_read_tokens=cache_read_tokens,
             output_tokens=output_tokens,
             duration_s=duration_s,
             used=used,
