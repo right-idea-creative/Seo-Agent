@@ -169,3 +169,95 @@ The `.gitignore` rule `.claude/` (without a leading `/`) applies recursively to 
 3. Run `pytest tests/` to establish baseline before any code changes.
 
 ---
+
+## 2026-08-03
+
+### Summary
+
+Fixed both open budget-tracking bugs (B1 and B2). No architecture changes, no prompt changes, no model changes. Suite grew from 54 to 65 tests.
+
+---
+
+### Investigation
+
+**B1 — `dual_qa_agent.py:555`**
+
+Confirmed the bug was present. `getattr(self._claude, '_budget', None)` always returned `None` because `self._claude` is an `LLMGateway` instance, which exposes `.budget` as a public property (no underscore). `_budget` is an internal attribute on `ClaudeService`, which `LLMGateway` wraps but does not re-expose. Result: `budget_svc` was always `None`, `_snap()` always returned `None`, `_claude_delta()` always returned `0.0`, and every `DualQAReport` field (`claude_review_cost_usd`, `revision_cost_usd`, etc.) was permanently `$0.00`. Underlying costs were correctly recorded in `BudgetService` by `ClaudeService` — only the per-report attribution was broken.
+
+**B2 — `openai_review_service.py`**
+
+Confirmed that neither `review_article()` (text review) nor `review_image()` (vision review) ever called any `BudgetService` method. Both methods correctly compute cost from `response.usage` token counts and accumulate it in `self.text_cost_usd` / `self.vision_cost_usd`. Those values are copied into `DualQAReport` fields (`openai_review_cost_usd`, `vision_openai_cost_usd`) at the end of `run()`. However, `BudgetService.record_openai()` was never called, so monthly budget totals never reflected these costs.
+
+**B2 — `BudgetService.record_openai()` incompatibility**
+
+`record_openai(images: int)` is image-generation-specific: it applies a fixed `$0.25/image` price and increments an `images` counter. Text/vision review costs are token-based (~$0.001–0.003/article) and must not corrupt the `images` counter. A new method `record_openai_text(cost_usd: float)` was added to `BudgetService` to handle review costs correctly.
+
+---
+
+### Fixes
+
+**`agents/dual_qa_agent.py:555`**
+
+```python
+# Before (broken):
+budget_svc = getattr(self._claude, '_budget', None)
+
+# After (fixed):
+budget_svc = getattr(self._claude, 'budget', None)
+```
+
+**`agents/dual_qa_agent.py` — 3 OpenAI recording sites added**
+
+- Main article review loop: captures `text_cost_usd` delta around `_openai_review_article()` and calls `budget_svc.record_openai_text(delta)`.
+- Rescue re-review path: reuses the existing `openai_before_cost`/`openai_after_cost` delta variables; adds one `budget_svc.record_openai_text()` call after the delta is computed.
+- Vision review in `_review_single_ai_image()`: captures `vision_cost_usd` delta around `review_image()` and calls `_vision_budget_svc.record_openai_text(delta)`. `budget_svc` is out of scope here (different method from `run()`), so `getattr(self._claude, 'budget', None)` is resolved fresh within the method.
+
+**`services/budget_service.py` — new `record_openai_text()` method**
+
+```python
+def record_openai_text(self, cost_usd: float) -> None:
+    if cost_usd <= 0:
+        return
+    with self._exclusive_lock():
+        data = self._load()
+        o = data["openai"]
+        o["calls"] += 1
+        o["usd"] = round(o["usd"] + cost_usd, 6)
+        self._save(data)
+```
+
+Does not touch `o["images"]`. Uses the same `_exclusive_lock()` as other record methods. Zero-cost calls are skipped (guard before the lock acquisition).
+
+**`tests/test_vision_qa_exception_handling.py` and `tests/test_dual_qa_openai_bypass.py`**
+
+Two pre-existing test stubs referenced `stub_claude._budget = None` (the old broken attribute name). Updated to `stub_claude.budget = None`. Also added `stub_openai.vision_cost_usd = 0.0` to the vision exception test so cost delta arithmetic does not hit a `MagicMock > int` TypeError.
+
+---
+
+### Tests Executed
+
+Baseline: `54 passed` (before any changes).
+
+After all changes: `65 passed` (11 new tests in `tests/test_qa_cost_attribution.py`).
+
+New tests cover:
+- `BudgetService.record_openai_text()`: records USD, increments calls, does not touch `images`, accumulates across calls, skips zero-cost calls, coexists with `record_openai()`.
+- `DualQAAgent` text review recording: `openai.usd` is non-zero after a review run; no recording when reviewer is absent.
+- `DualQAAgent` vision review recording: `openai.usd` is non-zero after vision review; `images` counter stays 0; exception during review records nothing.
+- B1 property name: typed stub (not `MagicMock`) confirms `.budget` resolves correctly and `._budget` returns `None` on an `LLMGateway`-like object.
+
+---
+
+### Risk Assessment
+
+**B1 fix** — Zero regression risk. One attribute name character changed. The `budget` property is the documented public interface. Two existing test stubs updated to use the correct attribute; both still pass.
+
+**B2 fix** — Low regression risk. All three recording sites guard on `cost_delta > 0` before writing to `BudgetService`, so no spurious writes. The `record_openai_text()` method acquires the same exclusive lock as other record methods; no race condition introduced. Adding costs to `openai.usd` in the existing budget file structure does not break any existing schema consumers.
+
+---
+
+### Next Steps
+
+None — B1 and B2 are closed. No open critical bugs remain.
+
+---
