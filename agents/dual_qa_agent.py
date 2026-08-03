@@ -552,7 +552,7 @@ class DualQAAgent:
         qa_start = _time.perf_counter()
 
         # Budget tracking helpers (reads Claude budget service snapshots)
-        budget_svc = getattr(self._claude, '_budget', None)
+        budget_svc = getattr(self._claude, 'budget', None)
 
         def _snap() -> dict | None:
             return budget_svc.status() if budget_svc else None
@@ -575,7 +575,12 @@ class DualQAAgent:
 
             # OpenAI review
             if self._openai is not None:
+                _oa_text_before = self._openai.text_cost_usd
                 openai_result = self._openai_review_article(current)
+                if budget_svc:
+                    _oa_delta = round(self._openai.text_cost_usd - _oa_text_before, 6)
+                    if _oa_delta > 0:
+                        budget_svc.record_openai_text(_oa_delta)
                 openai_approved = (
                     openai_result["writing_score"] >= self._min_writing
                     and openai_result["authenticity_score"] >= self._min_authenticity
@@ -1006,9 +1011,10 @@ class DualQAAgent:
                 "issues": [], "revision_instructions": "",
             }
         openai_after_cost = getattr(self._openai, 'text_cost_usd', 0.0)
-        report.authenticity_revision_openai_cost_usd += round(
-            openai_after_cost - openai_before_cost, 6
-        )
+        _rescue_oa_delta = round(openai_after_cost - openai_before_cost, 6)
+        report.authenticity_revision_openai_cost_usd += _rescue_oa_delta
+        if budget_svc and _rescue_oa_delta > 0:
+            budget_svc.record_openai_text(_rescue_oa_delta)
 
         # ── Step 3: Verdict ───────────────────────────────────────────────────
         rescue_writing = final_openai["writing_score"]
@@ -1566,6 +1572,8 @@ class DualQAAgent:
 
         # OpenAI Vision
         if self._openai is not None:
+            _vision_budget_svc = getattr(self._claude, 'budget', None)
+            _oa_vision_before = self._openai.vision_cost_usd
             try:
                 openai_result = self._openai.review_image(
                     asset.data, context, asset.mime_type,
@@ -1580,6 +1588,9 @@ class DualQAAgent:
                 )
                 openai_score = 0
                 openai_feedback = f"Review failed: {exc}"
+            _oa_vision_delta = round(self._openai.vision_cost_usd - _oa_vision_before, 6)
+            if _vision_budget_svc and _oa_vision_delta > 0:
+                _vision_budget_svc.record_openai_text(_oa_vision_delta)
             openai_approved = openai_score >= self._min_vision_openai
         else:
             openai_score = 100

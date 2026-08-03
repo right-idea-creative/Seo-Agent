@@ -49,7 +49,7 @@ def _make_agent_with_stub_claude(openai_reviewer=None):
     from agents.dual_qa_agent import DualQAAgent
 
     stub_claude = MagicMock()
-    stub_claude._budget = None  # budget_svc lookup via getattr
+    stub_claude.budget = None  # disable budget tracking in these unit tests
 
     agent = DualQAAgent(
         claude=stub_claude,

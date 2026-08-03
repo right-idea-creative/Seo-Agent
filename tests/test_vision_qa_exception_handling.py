@@ -20,9 +20,10 @@ class TestVisionExceptionHandling:
         from models.image_asset import ImageAsset, ImageSource
 
         stub_claude = MagicMock()
-        stub_claude._budget = None
+        stub_claude.budget = None  # disable budget tracking in this unit test
 
         stub_openai = MagicMock()
+        stub_openai.vision_cost_usd = 0.0  # must be float so delta arithmetic works
         stub_openai.review_image.side_effect = RuntimeError("Vision API timeout")
 
         agent = DualQAAgent(
@@ -59,7 +60,7 @@ class TestVisionExceptionHandling:
         from models.image_asset import ImageAsset, ImageSource
 
         stub_claude = MagicMock()
-        stub_claude._budget = None
+        stub_claude.budget = None  # disable budget tracking in this unit test
 
         agent = DualQAAgent(
             claude=stub_claude,

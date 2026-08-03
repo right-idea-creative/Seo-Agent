@@ -126,6 +126,26 @@ class BudgetService:
             images, cost, o["usd"],
         )
 
+    def record_openai_text(self, cost_usd: float) -> None:
+        """Record OpenAI text/vision review cost and persist the updated totals.
+
+        Separate from record_openai() which is image-generation-specific and
+        uses a fixed per-image price. Review costs are token-based and must
+        not modify the images counter.
+        """
+        if cost_usd <= 0:
+            return
+        with self._exclusive_lock():
+            data = self._load()
+            o = data["openai"]
+            o["calls"] += 1
+            o["usd"] = round(o["usd"] + cost_usd, 6)
+            self._save(data)
+        logger.debug(
+            "OpenAI text/vision review recorded: +$%.6f (total $%.4f)",
+            cost_usd, o["usd"],
+        )
+
     def status(self) -> dict:
         """Return current month's spend summary with limits."""
         data = self._load()
