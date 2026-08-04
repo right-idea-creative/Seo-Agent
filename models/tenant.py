@@ -36,6 +36,15 @@ class TenantContext(BaseModel):
             "Populated from SiteProfile.reuse_group at article-creation time."
         ),
     )
+    canonical_client: str | None = Field(
+        default=None,
+        description=(
+            "Canonical client identifier loaded from SiteProfile.canonical_client at "
+            "pipeline startup. Written to every BigQuery row for Cortex joins. "
+            "None in legacy article.json files serialized before Request #5 — "
+            "the publish gate validates and resolves it before any BQ write."
+        ),
+    )
 
     @field_validator("client_id", "website_id")
     @classmethod

@@ -17,6 +17,11 @@ from services.claude_service import ClaudeAPIError, ClaudeService, ClaudeRateLim
 
 logger = logging.getLogger(__name__)
 
+# Single authoritative source for the generation prompt version.
+# Bump this when the article-generation system prompt or user-turn builder
+# changes in a way that affects output quality or format.
+PROMPT_VERSION = "1.0"
+
 # Matches bracket placeholder tokens that must never reach generation.
 _PLACEHOLDER_RE = re.compile(
     r'\[(?:City|Service|Keyword|Topic|TOPIC|Location|Business|State|Country|Name|Date|Year|Niche)\]',
@@ -805,7 +810,7 @@ class ArticleAgent:
             content_markdown=body,
             seo=seo,
             model_name=self._service.model,
-            prompt_version="1.0",
+            prompt_version=PROMPT_VERSION,
             image_plans=plan.image_plans if plan else [],
             topic_id=self._make_topic_id(request.topic, request),
         )

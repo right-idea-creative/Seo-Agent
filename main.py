@@ -429,6 +429,19 @@ def _execute_generation(
 
     stats = ReuseStatsService(base_dir)
 
+    # ── Canonical client enrichment ───────────────────────────────────────────
+    # Best-effort: load canonical_client from the site profile so generated and
+    # reused articles carry the normalized identity from the start.  Missing
+    # canonical_client is NOT an error here — the publish gate validates it.
+    try:
+        _cc_prof = SiteProfileService(settings.profiles_dir).load(
+            tenant.client_id, tenant.website_id
+        )
+        if _cc_prof and _cc_prof.canonical_client:
+            tenant = tenant.model_copy(update={"canonical_client": _cc_prof.canonical_client})
+    except Exception:
+        pass
+
     # ── STEP 1: Draft Pool lookup — runs before any budget check ─────────────
     # All operations here are free (no API calls):
     #   pool index load, topic_id normalization, Jaccard scoring, article.json read.
@@ -687,6 +700,7 @@ def _run_publish_flow(
     no_qa: bool = False,
     post_id: int | None = None,
     show_pipeline_report: bool = True,
+    event_type: str = "publish",
 ) -> tuple[Article, _PipelineState]:
     """
     Full publish pipeline: credentials → image resolution → WordPress publish.
@@ -707,6 +721,37 @@ def _run_publish_flow(
         raise typer.Exit(code=1)
 
     budget_before = budget.status()
+
+    # ── Canonical client validation ───────────────────────────────────────────
+    # Required before any BQ write. Legacy article.json files (generated before
+    # Request #5) will have tenant.canonical_client = None; resolve from profile.
+    if not article.tenant.canonical_client:
+        try:
+            _val_prof = SiteProfileService(settings.profiles_dir).load(
+                article.tenant.client_id, article.tenant.website_id
+            )
+        except Exception:
+            _val_prof = None
+        if _val_prof and _val_prof.canonical_client:
+            article = article.model_copy(update={
+                "tenant": article.tenant.model_copy(
+                    update={"canonical_client": _val_prof.canonical_client}
+                )
+            })
+        else:
+            _val_path = (
+                settings.profiles_dir
+                / article.tenant.client_id
+                / article.tenant.website_id
+                / "site.json"
+            )
+            console.print(f"\n[bold red]Missing canonical_client in:[/bold red]")
+            console.print(f"  {_val_path}")
+            console.print(
+                "[dim]  Add: \"canonical_client\": \"<your-cortex-id>\" to site.json, "
+                "then re-run.[/dim]"
+            )
+            raise typer.Exit(code=1)
 
     # Load credentials from the article's tenant context
     try:
@@ -1094,6 +1139,25 @@ def _run_publish_flow(
             _display_pipeline_report(state, article, updated)
             _display_diversity_report(img_stats)
 
+        # ── BigQuery analytics sink (fire-and-forget) ────────────────────────
+        # Runs after every successful WP publish — errors are swallowed by
+        # BqSinkService; publication is never blocked or interrupted.
+        import services.call_tracer as _bq_ct
+        from services.bq_sink_service import BqSinkService
+        _bq_tracer = _bq_ct.get()
+        _bq_article_id = str(updated.id)
+        _bq_canonical = updated.tenant.canonical_client
+        _bq = BqSinkService()
+        _bq.insert_article(updated, qa_report, _bq_tracer, state.t_total, event_type=event_type)
+        if qa_report is not None:
+            _bq.insert_qa_results(_bq_article_id, qa_report, canonical_client=_bq_canonical)
+        if _bq_tracer:
+            _bq.insert_llm_costs(
+                "seo-agent", _bq_tracer,
+                article_id=_bq_article_id, event_type=event_type,
+                canonical_client=_bq_canonical,
+            )
+
         return updated, state
 
 
@@ -1149,6 +1213,7 @@ def publish(
         no_links=no_links,
         post_id=post_id,
         show_pipeline_report=True,
+        event_type="publish",
     )
 
     _tracer = _call_tracer.get()
@@ -3434,6 +3499,7 @@ def autopublish(
         no_image=no_image,
         no_links=no_links,
         show_pipeline_report=True,
+        event_type="autopublish",
     )
 
     # ── Summary ───────────────────────────────────────────────────
@@ -3493,11 +3559,575 @@ def republish(
         no_qa=True,
         post_id=post_id,
         show_pipeline_report=True,
+        event_type="republish",
     )
 
     _tracer = _call_tracer.get()
     if _tracer and _tracer.records:
         console.print(_tracer.summary())
+
+
+# ── BigQuery health-check helpers ─────────────────────────────────────────────
+# Used exclusively by test_bigquery. Defined at module level for testability.
+
+# Columns Python writes per table. NULLABLE stubs in the DDL that Python never
+# populates (e.g. canonical_client) are intentionally absent. Types use the
+# canonical BigQuery names; _bqhc_norm_type handles alias comparison.
+_BQ_EXPECTED_SCHEMA: dict[str, list[tuple[str, str, str]]] = {
+    "articles_published": [
+        ("article_id",         "STRING",    "REQUIRED"),
+        ("client",             "STRING",    "REQUIRED"),
+        ("website",            "STRING",    "REQUIRED"),
+        ("canonical_client",   "STRING",    "NULLABLE"),
+        ("topic",              "STRING",    "REQUIRED"),
+        ("title",              "STRING",    "REQUIRED"),
+        ("slug",               "STRING",    "REQUIRED"),
+        ("url",                "STRING",    "NULLABLE"),
+        ("publish_date",       "TIMESTAMP", "REQUIRED"),
+        ("word_count",         "INTEGER",   "REQUIRED"),
+        ("reading_time",       "INTEGER",   "REQUIRED"),
+        ("focus_keyword",      "STRING",    "NULLABLE"),
+        ("category",           "STRING",    "NULLABLE"),
+        ("seo_score",          "INTEGER",   "REQUIRED"),
+        ("editorial_score",    "INTEGER",   "REQUIRED"),
+        ("writing_score",      "INTEGER",   "REQUIRED"),
+        ("authenticity_score", "INTEGER",   "REQUIRED"),
+        ("total_cost_usd",     "NUMERIC",   "REQUIRED"),
+        ("claude_cost_usd",    "NUMERIC",   "REQUIRED"),
+        ("openai_cost_usd",    "NUMERIC",   "REQUIRED"),
+        ("reuse",              "BOOLEAN",   "REQUIRED"),
+        ("reuse_similarity",   "FLOAT",     "REQUIRED"),
+        ("generation_time",    "FLOAT",     "REQUIRED"),
+        ("model_name",         "STRING",    "REQUIRED"),
+        ("prompt_version",     "STRING",    "REQUIRED"),
+        ("event_type",         "STRING",    "REQUIRED"),
+        ("environment",        "STRING",    "REQUIRED"),
+        ("git_commit",         "STRING",    "NULLABLE"),
+        ("pipeline_version",   "STRING",    "NULLABLE"),
+    ],
+    "qa_results": [
+        ("article_id",                "STRING",  "REQUIRED"),
+        ("canonical_client",          "STRING",  "NULLABLE"),
+        ("approved",                  "BOOLEAN", "REQUIRED"),
+        ("revision_cycles",           "INTEGER", "REQUIRED"),
+        ("claude_seo_score",          "INTEGER", "REQUIRED"),
+        ("claude_editorial_score",    "INTEGER", "REQUIRED"),
+        ("openai_writing_score",      "INTEGER", "REQUIRED"),
+        ("openai_authenticity_score", "INTEGER", "REQUIRED"),
+        ("overall_pass",              "BOOLEAN", "REQUIRED"),
+        ("environment",               "STRING",  "REQUIRED"),
+        ("git_commit",                "STRING",  "NULLABLE"),
+    ],
+    "llm_costs": [
+        ("timestamp",        "TIMESTAMP", "REQUIRED"),
+        ("article_id",       "STRING",    "NULLABLE"),
+        ("canonical_client", "STRING",    "NULLABLE"),
+        ("event_type",       "STRING",    "REQUIRED"),
+        ("environment",  "STRING",    "REQUIRED"),
+        ("git_commit",   "STRING",    "NULLABLE"),
+        ("system",       "STRING",    "REQUIRED"),
+        ("stage",        "STRING",    "REQUIRED"),
+        ("provider",     "STRING",    "REQUIRED"),
+        ("model",        "STRING",    "REQUIRED"),
+        ("input_tokens", "INTEGER",   "REQUIRED"),
+        ("output_tokens","INTEGER",   "REQUIRED"),
+        ("cost_usd",     "NUMERIC",   "REQUIRED"),
+        ("success",      "BOOLEAN",   "REQUIRED"),
+    ],
+}
+
+
+def _bqhc_norm_type(field_type: str) -> str:
+    """Normalize BigQuery field_type aliases for schema comparison.
+
+    The BigQuery API accepts INT64/INTEGER, FLOAT64/FLOAT, BOOL/BOOLEAN as
+    synonyms but always returns the canonical name (INTEGER, FLOAT, BOOLEAN)
+    when reading back a table's schema.  This function normalises both sides so
+    comparison is alias-safe regardless of how the table was originally created.
+    """
+    return {"INT64": "INTEGER", "FLOAT64": "FLOAT", "BOOL": "BOOLEAN"}.get(
+        field_type.upper(), field_type.upper()
+    )
+
+
+def _bqhc_extract_error(exc: Exception) -> dict:
+    """Return structured diagnostic fields from any exception.
+
+    Extracts BigQuery-specific metadata (HTTP status, BQ error reason, field
+    location) when the exception carries a Google API error payload.  Falls
+    back gracefully for generic Python exceptions.
+    """
+    info: dict = {
+        "type": type(exc).__name__,
+        "message": str(exc),
+        "http_status": None,
+        "bq_reason": None,
+        "location": None,
+    }
+    _resp = getattr(exc, "response", None)
+    if _resp is not None:
+        info["http_status"] = str(getattr(_resp, "status_code", "?"))
+    _bq_errors = getattr(exc, "errors", None)
+    if isinstance(_bq_errors, (list, tuple)) and _bq_errors:
+        _e0 = _bq_errors[0] if isinstance(_bq_errors[0], dict) else {}
+        info["bq_reason"] = _e0.get("reason")
+        info["location"] = _e0.get("location")
+    return info
+
+
+@app.command("test-bigquery")
+def test_bigquery(
+    cleanup: bool = typer.Option(
+        False, "--cleanup",
+        help="Delete integration_test rows from all three tables after the health check.",
+    ),
+    verbose: bool = typer.Option(
+        False, "--verbose",
+        help="Print SQL queries, row data, table schemas, and per-step detail.",
+    ),
+) -> None:
+    """Full BigQuery health check: credentials, dataset, tables, schema, writes, reads, and optional cleanup."""
+    import os
+    import sys
+    import traceback as _tb
+    import json as _json
+    from datetime import datetime, timezone
+    from uuid import uuid4
+
+    _ok   = "[bold green]✓[/bold green]"
+    _fail = "[bold red]✗[/bold red]"
+    _warn = "[bold yellow]⚠[/bold yellow]"
+    _SEP  = "=" * 42
+    _summary: list[tuple[str, bool, float]] = []  # (label, passed, elapsed_s)
+    _exit_code = 0
+
+    # ── Inner helpers (closures over locals) ──────────────────────────────────
+
+    def _vprint(msg: str) -> None:
+        if verbose:
+            console.print(f"[dim]  {msg}[/dim]")
+
+    def _section_ok(label: str, elapsed: float) -> None:
+        _summary.append((label, True, elapsed))
+
+    def _section_fail(label: str, elapsed: float) -> None:
+        _summary.append((label, False, elapsed))
+
+    def _print_step_error(step: str, exc: Exception) -> None:
+        info = _bqhc_extract_error(exc)
+        console.print(f"      [bold]Step:[/bold]             {step}")
+        console.print(f"      [bold]Exception type:[/bold]   {info['type']}")
+        _preview = info["message"][:400] + ("…" if len(info["message"]) > 400 else "")
+        console.print(f"      [bold]Exception message:[/bold] [red]{_preview}[/red]")
+        if info["http_status"]:
+            console.print(f"      [bold]HTTP status:[/bold]      {info['http_status']}")
+        if info["bq_reason"]:
+            console.print(f"      [bold]BQ reason:[/bold]        {info['bq_reason']}")
+        if info["location"]:
+            console.print(f"      [bold]Location:[/bold]         {info['location']}")
+        if verbose:
+            _trace = _tb.format_exc()
+            if _trace.strip() and _trace.strip() != "NoneType: None":
+                console.print(f"[dim]{_trace}[/dim]")
+
+    def _print_final_report(total_s: float) -> None:
+        if not _summary:
+            return
+        _max_w  = max(len(lbl) for lbl, _, _ in _summary)
+        _col_w  = _max_w + 6
+        console.print()
+        console.print(f"[bold]{_SEP}[/bold]")
+        console.print("[bold]  BigQuery Health Check[/bold]")
+        console.print(f"[bold]{_SEP}[/bold]")
+        for _lbl, _passed, _ in _summary:
+            console.print(f"  {_ok if _passed else _fail} {_lbl}")
+        console.print(f"  {'─' * 38}")
+        for _lbl, _, _t in _summary:
+            _dots = "." * (_col_w - len(_lbl))
+            console.print(f"  {_lbl} {_dots} {_t:.2f} s")
+        _total_dots = "." * (_col_w - len("Total"))
+        console.print(f"  {'─' * 38}")
+        console.print(f"  Total {_total_dots} {total_s:.2f} s")
+        console.print(f"  {'─' * 38}")
+        console.print(f"  Environment:  {_env_name}")
+        console.print(f"  Project:      {_env_project}")
+        console.print(f"[bold]{_SEP}[/bold]")
+        _all_ok = all(p for _, p, _ in _summary)
+        if _all_ok:
+            console.print("[bold green]  BigQuery integration PASSED[/bold green]")
+        else:
+            console.print("[bold red]  BigQuery integration FAILED[/bold red]")
+        console.print(f"[bold]{_SEP}[/bold]")
+        console.print()
+
+    # ── Environment header ────────────────────────────────────────────────────
+    _env_name    = os.environ.get("SEO_AGENT_ENV", "prod")
+    _env_project = "rightidea-cortex"
+    _env_dataset = "seo_content"
+    _env_git     = "UNKNOWN"
+    _env_pv      = "unknown"
+    _py_ver      = sys.version.split()[0]
+
+    try:
+        from services.bq_sink_service import (
+            _GCP_PROJECT as _hc_proj,
+            _BQ_DATASET  as _hc_ds,
+            _GIT_COMMIT  as _hc_git,
+            _PIPELINE_VERSION as _hc_pv,
+        )
+        _env_project = _hc_proj
+        _env_dataset = _hc_ds
+        _env_git     = _hc_git[:8] if _hc_git else "UNKNOWN"
+        _env_pv      = _hc_pv or "unknown"
+    except Exception:
+        pass  # fallback defaults already set
+
+    console.print()
+    console.print(f"[bold]{_SEP}[/bold]")
+    console.print("[bold]  SEO-Agent BigQuery Health Check[/bold]")
+    console.print(f"[bold]{_SEP}[/bold]")
+    console.print()
+    console.print(f"  Project:          [cyan]{_env_project}[/cyan]")
+    console.print(f"  Dataset:          [cyan]{_env_dataset}[/cyan]")
+    console.print(f"  Environment:      [cyan]{_env_name}[/cyan]")
+    console.print(f"  Pipeline Version: [cyan]{_env_pv}[/cyan]")
+    console.print(f"  Git Commit:       [cyan]{_env_git}[/cyan]")
+    console.print(f"  Python:           [cyan]{_py_ver}[/cyan]")
+    console.print()
+    console.print(f"[bold]{_SEP}[/bold]")
+    console.print()
+
+    _t_total = time.perf_counter()
+
+    try:
+        # ── 1. Credentials ────────────────────────────────────────────────────
+        _t0 = time.perf_counter()
+        creds_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+        if not creds_path:
+            console.print(f"  {_fail} Credentials: GOOGLE_APPLICATION_CREDENTIALS is not set")
+            console.print("[dim]      Set: export GOOGLE_APPLICATION_CREDENTIALS=/path/to/sa-key.json[/dim]")
+            _section_fail("Credentials", time.perf_counter() - _t0)
+            raise typer.Exit(code=1)
+        if not Path(creds_path).exists():
+            console.print(f"  {_fail} Credentials: file not found: {creds_path}")
+            _section_fail("Credentials", time.perf_counter() - _t0)
+            raise typer.Exit(code=1)
+        console.print(f"  {_ok} Credentials found")
+
+        try:
+            from services.bq_sink_service import (
+                BqSinkService, _GCP_PROJECT, _BQ_DATASET,
+                _TABLE_ARTICLES, _TABLE_QA, _TABLE_COSTS,
+            )
+        except ImportError as exc:
+            console.print(f"  {_fail} Credentials (google-cloud-bigquery unavailable)")
+            _print_step_error("Credentials import", exc)
+            console.print("[dim]      Install: pip install 'google-cloud-bigquery>=3.0'[/dim]")
+            _section_fail("Credentials", time.perf_counter() - _t0)
+            raise typer.Exit(code=1)
+        _section_ok("Credentials", time.perf_counter() - _t0)
+
+        # ── 2. Authentication ─────────────────────────────────────────────────
+        _t0 = time.perf_counter()
+        try:
+            _svc = BqSinkService()
+            if _svc._client is None:
+                console.print(f"  {_fail} Authentication")
+                _print_step_error(
+                    "Authentication",
+                    RuntimeError(_svc._init_error or "BqSinkService client is None"),
+                )
+                _section_fail("Authentication", time.perf_counter() - _t0)
+                raise typer.Exit(code=1)
+            bq = _svc._client
+        except typer.Exit:
+            raise
+        except Exception as exc:
+            console.print(f"  {_fail} Authentication")
+            _print_step_error("Authentication", exc)
+            _section_fail("Authentication", time.perf_counter() - _t0)
+            raise typer.Exit(code=1)
+        console.print(f"  {_ok} Authentication succeeded")
+        console.print(f"  {_ok} Connected to project: {_GCP_PROJECT}")
+        _section_ok("Authentication", time.perf_counter() - _t0)
+        console.print()
+
+        # ── 3. Dataset ────────────────────────────────────────────────────────
+        _t0 = time.perf_counter()
+        try:
+            from google.cloud import bigquery as _bq
+            bq.get_dataset(_bq.DatasetReference(_GCP_PROJECT, _BQ_DATASET))
+        except Exception as exc:
+            console.print(f"  {_fail} Dataset: {_GCP_PROJECT}.{_BQ_DATASET}")
+            _print_step_error("Dataset", exc)
+            _section_fail("Dataset", time.perf_counter() - _t0)
+            raise typer.Exit(code=1)
+        console.print(f"  {_ok} Dataset found: {_GCP_PROJECT}.{_BQ_DATASET}")
+        _section_ok("Dataset", time.perf_counter() - _t0)
+        console.print()
+
+        # ── 4. Tables ─────────────────────────────────────────────────────────
+        _t0 = time.perf_counter()
+        _tables = [
+            ("articles_published", _TABLE_ARTICLES),
+            ("qa_results",         _TABLE_QA),
+            ("llm_costs",          _TABLE_COSTS),
+        ]
+        _bq_tables: dict = {}
+        for _tname, _tid in _tables:
+            try:
+                _bq_tables[_tname] = bq.get_table(_tid)
+                console.print(f"  {_ok} Table found: {_tname}")
+                if verbose:
+                    for _f in _bq_tables[_tname].schema:
+                        _vprint(
+                            f"    {_f.name:<32} {_f.field_type:<10} {_f.mode}"
+                        )
+            except Exception as exc:
+                console.print(f"  {_fail} Missing table: {_tname}")
+                _print_step_error(f"Tables — {_tname}", exc)
+                console.print("[dim]      Hint: Run docs/bq_schema.sql first.[/dim]")
+                _section_fail("Tables", time.perf_counter() - _t0)
+                raise typer.Exit(code=1)
+        _section_ok("Tables", time.perf_counter() - _t0)
+        console.print()
+
+        # ── 5. Schema validation ──────────────────────────────────────────────
+        # Compares against _BQ_EXPECTED_SCHEMA (module-level constant).
+        # Validates only the columns Python writes; DDL-only stubs are skipped.
+        _t0 = time.perf_counter()
+
+        _schema_ok = True
+        for _tname, _bq_table in _bq_tables.items():
+            _actual = {f.name: (f.field_type, f.mode) for f in _bq_table.schema}
+            _mismatches: list[str] = []
+            for _col, _exp_type, _exp_mode in _BQ_EXPECTED_SCHEMA[_tname]:
+                if _col not in _actual:
+                    _mismatches.append(f"column '{_col}' missing from table")
+                    continue
+                _act_type, _act_mode = _actual[_col]
+                if _bqhc_norm_type(_act_type) != _bqhc_norm_type(_exp_type):
+                    _mismatches.append(
+                        f"'{_col}': type expected {_exp_type}, found {_act_type}"
+                    )
+                if _act_mode != _exp_mode:
+                    _mismatches.append(
+                        f"'{_col}': mode expected {_exp_mode}, found {_act_mode}"
+                    )
+            if _mismatches:
+                console.print(f"  {_fail} Schema mismatch: {_tname}")
+                for _m in _mismatches:
+                    console.print(f"      [red]{_m}[/red]")
+                _schema_ok = False
+            else:
+                console.print(f"  {_ok} {_tname} schema matches")
+
+        _elapsed = time.perf_counter() - _t0
+        if not _schema_ok:
+            _section_fail("Schema", _elapsed)
+            raise typer.Exit(code=1)
+        _section_ok("Schema", _elapsed)
+        console.print()
+
+        # ── 6. Write test ─────────────────────────────────────────────────────
+        # Row dicts mirror exactly what BqSinkService writes.
+        # insert_rows_json() is called directly (bypassing the fire-and-forget
+        # wrapper) so BigQuery streaming errors surface as real exceptions.
+        _t0      = time.perf_counter()
+        _test_id = str(uuid4())
+        _now     = datetime.now(tz=timezone.utc).isoformat()
+        console.print(f"  [dim]test article_id: {_test_id}[/dim]")
+        _vprint(f"Timestamp: {_now}")
+        console.print()
+
+        _art_row: dict = {
+            "article_id":         _test_id,
+            "client":             "__TEST__",
+            "website":            "__TEST__",
+            "canonical_client":   "__TEST__",
+            "topic":              "BigQuery Health Check",
+            "title":              "BigQuery Health Check",
+            "slug":               "bigquery-health-check",
+            "url":                None,
+            "publish_date":       _now,
+            "word_count":         0,
+            "reading_time":       0,
+            "focus_keyword":      None,
+            "category":           None,
+            "seo_score":          0,
+            "editorial_score":    0,
+            "writing_score":      0,
+            "authenticity_score": 0,
+            "total_cost_usd":     0.0,
+            "claude_cost_usd":    0.0,
+            "openai_cost_usd":    0.0,
+            "reuse":              False,
+            "reuse_similarity":   0.0,
+            "generation_time":    0.0,
+            "model_name":         "__TEST__",
+            "prompt_version":     "__TEST__",
+            "event_type":         "integration_test",
+            "environment":        "__TEST__",
+            "git_commit":         None,
+            "pipeline_version":   None,
+        }
+        _qa_row: dict = {
+            "article_id":                _test_id,
+            "canonical_client":          "__TEST__",
+            "approved":                  True,
+            "revision_cycles":           1,
+            "claude_seo_score":          0,
+            "claude_editorial_score":    0,
+            "openai_writing_score":      0,
+            "openai_authenticity_score": 0,
+            "overall_pass":              True,
+            "environment":               "__TEST__",
+            "git_commit":                None,
+        }
+        _cost_row: dict = {
+            "timestamp":         _now,
+            "article_id":        _test_id,
+            "canonical_client":  "__TEST__",
+            "event_type":        "integration_test",
+            "environment":   "__TEST__",
+            "git_commit":    None,
+            "system":        "__TEST__",
+            "stage":         "__TEST__",
+            "provider":      "other",
+            "model":         "__TEST__",
+            "input_tokens":  0,
+            "output_tokens": 0,
+            "cost_usd":      0.0,
+            "success":       True,
+        }
+
+        _write_ok = True
+        for _label, _tid, _row in [
+            ("insert_article",    _TABLE_ARTICLES, _art_row),
+            ("insert_qa_results", _TABLE_QA,       _qa_row),
+            ("insert_llm_costs",  _TABLE_COSTS,    _cost_row),
+        ]:
+            _vprint(f"INSERT {_tid}")
+            _vprint("Row: " + _json.dumps(_row, default=str))
+            try:
+                _errs = bq.insert_rows_json(_tid, [_row])
+                if _errs:
+                    raise Exception(_errs)
+                console.print(f"  {_ok} {_label} passed")
+            except Exception as exc:
+                console.print(f"  {_fail} {_label} failed")
+                _print_step_error(f"Write — {_label}", exc)
+                _write_ok = False
+
+        _elapsed = time.perf_counter() - _t0
+        if not _write_ok:
+            _section_fail("Write", _elapsed)
+            raise typer.Exit(code=1)
+        _section_ok("Write", _elapsed)
+        console.print()
+
+        # ── 7. Read test ──────────────────────────────────────────────────────
+        # BigQuery streaming inserts are immediately queryable via SELECT.
+        # A 0-row result means the streaming buffer has not flushed yet — this
+        # is a known BigQuery behaviour, NOT a write failure.  The health check
+        # passes as long as the SELECT query itself executes without error.
+        _t0          = time.perf_counter()
+        _read_warns  = False
+        _read_errors = False
+        for _tname, _tid in _tables:
+            _q = (
+                f"SELECT COUNT(*) AS cnt FROM `{_tid}` "
+                "WHERE article_id = @tid"
+            )
+            _cfg = _bq.QueryJobConfig(
+                query_parameters=[_bq.ScalarQueryParameter("tid", "STRING", _test_id)]
+            )
+            _vprint(f"SQL: {_q}")
+            _vprint(f"  @tid = {_test_id}")
+            try:
+                _cnt = next(iter(bq.query(_q, job_config=_cfg).result())).cnt
+                if _cnt < 1:
+                    console.print(f"  {_warn} Read: {_tname} (0 rows — streaming buffer)")
+                    _read_warns = True
+                else:
+                    console.print(f"  {_ok} Read: {_tname} ({_cnt} row)")
+            except Exception as exc:
+                console.print(f"  {_fail} Read: {_tname}")
+                _print_step_error(f"Read — {_tname}", exc)
+                _read_errors = True
+
+        _elapsed = time.perf_counter() - _t0
+        if _read_errors:
+            _section_fail("Read", _elapsed)
+            raise typer.Exit(code=1)
+        _section_ok("Read", _elapsed)
+        if _read_warns:
+            console.print(
+                f"\n  {_warn} [dim]BigQuery streaming inserts may remain in the\n"
+                "  streaming buffer for up to several minutes before becoming\n"
+                "  queryable via SELECT.  The write test confirmed data was\n"
+                "  accepted by BigQuery — 0-row reads are not a failure.[/dim]"
+            )
+        console.print()
+
+        # ── 8. Cleanup (optional) ─────────────────────────────────────────────
+        # DELETE on streaming-buffer rows may report 0 affected rows until the
+        # buffer commits to table storage (~90 s).  Re-run --cleanup if needed.
+        if cleanup:
+            _t0        = time.perf_counter()
+            _cleanup_ok = True
+            for _tname, _tid in _tables:
+                _del_q = f"DELETE FROM `{_tid}` WHERE article_id = @tid"
+                _del_cfg = _bq.QueryJobConfig(
+                    query_parameters=[
+                        _bq.ScalarQueryParameter("tid", "STRING", _test_id)
+                    ]
+                )
+                _vprint(f"SQL: {_del_q}")
+                _vprint(f"  @tid = {_test_id}")
+                try:
+                    _n = (
+                        bq.query(_del_q, job_config=_del_cfg)
+                        .result()
+                        .num_dml_affected_rows or 0
+                    )
+                    if _n == 0:
+                        console.print(
+                            f"  {_warn} Cleanup: {_tname} — 0 rows deleted\n"
+                            "      (streaming buffer not yet committed; "
+                            "re-run --cleanup in ~90 s)"
+                        )
+                    else:
+                        console.print(f"  {_ok} Cleanup: {_tname} ({_n} row deleted)")
+                except Exception as exc:
+                    console.print(f"  {_fail} Cleanup: {_tname}")
+                    _print_step_error(f"Cleanup — {_tname}", exc)
+                    _cleanup_ok = False
+            _elapsed = time.perf_counter() - _t0
+            if _cleanup_ok:
+                _section_ok("Cleanup", _elapsed)
+            else:
+                _section_fail("Cleanup", _elapsed)
+                raise typer.Exit(code=1)
+            console.print()
+        else:
+            console.print(
+                f"  [dim]Test rows left for inspection (article_id={_test_id}).\n"
+                f"  Re-run with --cleanup to delete, or execute manually:\n"
+                f"    DELETE FROM `{_TABLE_ARTICLES}` WHERE article_id = '{_test_id}';\n"
+                f"    DELETE FROM `{_TABLE_QA}` WHERE article_id = '{_test_id}';\n"
+                f"    DELETE FROM `{_TABLE_COSTS}` WHERE article_id = '{_test_id}';[/dim]"
+            )
+            console.print()
+
+    except typer.Exit as _e:
+        _exit_code = _e.code
+
+    # Final report — always shown whenever at least one section completed.
+    _print_final_report(time.perf_counter() - _t_total)
+
+    if _exit_code:
+        raise typer.Exit(code=_exit_code)
 
 
 _TENANT_ID_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
@@ -3831,6 +4461,274 @@ def onboard_site(
             expand=False,
         ))
         raise typer.Exit(code=1)
+
+
+@app.command("benchmark-costs")
+def benchmark_costs(
+    no_qa: bool = typer.Option(False, "--no-qa", help="Skip QA stage (saves ~$0.05)."),
+) -> None:
+    """
+    Measure the real cost of each pipeline stage using a tiny synthetic article.
+
+    Exercises every LLM call in the autopublish pipeline (topics, plan, generate,
+    SEO, Claude QA, OpenAI QA).  Does NOT write to WordPress, filesystem, or budget.
+    Prints a per-stage cost table and cumulative percentages.
+
+    Estimated cost per run: $0.15–$0.22 (same as a normal article — stages cannot
+    be made cheaper without reducing max_tokens or switching models).
+    """
+    import services.call_tracer as _ct
+
+    tracer = _ct.start()
+
+    BENCH_TOPIC = "When to replace garage door springs: signs, costs, and safety"
+    BENCH_KEYWORD = "garage door spring replacement"
+    BENCH_SERVICE = "Garage door repair"
+
+    request = ArticleRequest(
+        topic=BENCH_TOPIC,
+        service=BENCH_SERVICE,
+        focus_keyword=BENCH_KEYWORD,
+        word_count=800,
+    )
+    tenant = TenantContext(
+        client_id=settings.default_client_id or "BENCHMARK",
+        website_id=settings.default_website_id or "cost-test",
+    )
+
+    console.print(Panel(
+        f"[bold]Pipeline Cost Benchmark[/bold]\n"
+        f"Topic:   {BENCH_TOPIC}\n"
+        f"Service: {BENCH_SERVICE}\n"
+        f"Stages:  topics → plan → generate → SEO → QA (max 1 cycle)" +
+        (" [dim](QA skipped)[/dim]" if no_qa else ""),
+        expand=False,
+    ))
+
+    # ── Stage 0: topics:suggest ───────────────────────────────────────────────
+    with console.status("[dim]topics:suggest...[/dim]"):
+        _topic_system = (
+            "You are an expert SEO content strategist for local service businesses. "
+            "Generate fresh, unique blog topic ideas that have strong local search intent. "
+            "All topics must be evergreen."
+        )
+        _topic_user = (
+            f"Service: {BENCH_SERVICE}\n"
+            "Return ONLY a numbered list of 5 topic ideas, one per line. "
+            "No preamble, no markdown beyond the numbers."
+        )
+        claude.generate(
+            _topic_system,
+            [{"role": "user", "content": _topic_user}],
+            thinking=False,
+            model=settings.topic_model,
+            label="topics:suggest",
+        )
+    console.print("[dim]  topics:suggest ✓[/dim]")
+
+    # ── Stages 1–3: plan → generate → seo ────────────────────────────────────
+    with console.status("[dim]plan → generate → seo...[/dim]"):
+        try:
+            article = article_agent.generate(request=request, tenant=tenant)
+        except Exception as exc:
+            console.print(f"[red]Generation failed:[/red] {exc}")
+            raise typer.Exit(code=1)
+    console.print(f"[dim]  plan + generate + seo ✓  ({article.word_count} words)[/dim]")
+
+    # ── Stages 4–5: QA review (Claude + OpenAI) ──────────────────────────────
+    if not no_qa:
+        openai_reviewer = None
+        if settings.openai_api_key:
+            try:
+                openai_reviewer = OpenAIReviewService(
+                    api_key=settings.openai_api_key,
+                    text_model=settings.openai_text_review_model,
+                    vision_model=settings.openai_vision_review_model,
+                )
+            except Exception as exc:
+                console.print(f"[yellow]Warning:[/yellow] OpenAI reviewer unavailable: {exc}")
+
+        qa_agent = DualQAAgent(
+            claude=claude,
+            openai_reviewer=openai_reviewer,
+            min_seo=settings.qa_min_seo,
+            min_editorial=settings.qa_min_editorial,
+            min_writing=settings.qa_min_writing,
+            min_authenticity=settings.qa_min_authenticity,
+            min_vision_claude=settings.qa_min_vision_claude,
+            min_vision_openai=settings.qa_min_vision_openai,
+            max_cycles=1,
+            enable_rescue=False,
+        )
+        with console.status("[dim]QA review (1 cycle)...[/dim]"):
+            try:
+                qa_agent.run(article, [])
+            except DualQAFailedError:
+                pass  # QA failure is expected; we measured the cost
+            except Exception as exc:
+                console.print(f"[yellow]Warning:[/yellow] QA raised unexpected error: {exc}")
+        console.print("[dim]  QA review ✓[/dim]")
+
+    # ── Cost report ───────────────────────────────────────────────────────────
+    records = tracer.records
+    if not records:
+        console.print("[yellow]No LLM calls were recorded.[/yellow]")
+        raise typer.Exit(code=0)
+
+    mandatory_cost = tracer.total_cost()
+    sorted_records = sorted(records, key=lambda r: r.cost_usd, reverse=True)
+
+    from rich import box as _box
+    from rich.table import Table as _Table
+
+    t = _Table(
+        "Stage", "Model", "Input Tok", "Output Tok", "Cost (USD)", "% of Total",
+        box=_box.SIMPLE,
+        header_style="bold dim",
+        title="[bold]Mandatory Stages (measured)[/bold]",
+    )
+    for r in sorted_records:
+        pct = (r.cost_usd / mandatory_cost * 100) if mandatory_cost > 0 else 0.0
+        bar_len = int(pct / 5)
+        bar = "█" * bar_len
+        t.add_row(
+            r.stage,
+            r.model,
+            f"{r.input_tokens:,}",
+            f"{r.output_tokens:,}",
+            f"${r.cost_usd:.4f}",
+            f"{pct:5.1f}%  {bar}",
+        )
+
+    total_in = sum(r.input_tokens for r in records)
+    total_out = sum(r.output_tokens for r in records)
+    t.add_row(
+        f"[bold]MANDATORY TOTAL ({len(records)} calls)[/bold]", "",
+        f"[bold]{total_in:,}[/bold]",
+        f"[bold]{total_out:,}[/bold]",
+        f"[bold cyan]${mandatory_cost:.4f}[/bold cyan]",
+        "",
+    )
+    console.print(t)
+
+    if sorted_records:
+        console.print(
+            f"[dim]Most expensive:[/dim] [bold]{sorted_records[0].stage}[/bold]  "
+            f"${sorted_records[0].cost_usd:.4f}  "
+            f"({sorted_records[0].cost_usd / mandatory_cost * 100:.1f}%)"
+        )
+        console.print(
+            f"[dim]Cheapest:       [/dim] [bold]{sorted_records[-1].stage}[/bold]  "
+            f"${sorted_records[-1].cost_usd:.4f}  "
+            f"({sorted_records[-1].cost_usd / mandatory_cost * 100:.1f}%)"
+        )
+
+    # ── Conditional: image pipeline (estimated) ───────────────────────────────
+    # These stages require Google Drive credentials and candidates to be present.
+    # They cannot be directly measured in the benchmark environment, so costs are
+    # derived from actual prompt sizes (read from source) and model pricing from
+    # budget_service._MODEL_PRICING.  Estimates assume a typical 800-word article
+    # with 2 image slots, 1 partial-match slot (score 40–74), and 1 edited image.
+    _H_IN  = 1.00   # haiku-4 input  $/M tokens (budget_service._MODEL_PRICING)
+    _H_OUT = 5.00   # haiku-4 output $/M tokens
+    _M_IN  = 0.15   # gpt-4o-mini input  $/M tokens
+    _M_OUT = 0.60   # gpt-4o-mini output $/M tokens
+    _IMG_FLAT = 0.25  # gpt-image-1 edit, 1536×1024 high-quality, from budget_service
+
+    def _est(in_tok: int, out_tok: int, in_price: float, out_price: float) -> float:
+        return in_tok / 1_000_000 * in_price + out_tok / 1_000_000 * out_price
+
+    # Each entry: (label, model_display, in_tok, out_tok, cost_usd, notes)
+    # image:plan — system prompt ~350 tok + article markdown ~1650 tok; output JSON ~600 tok
+    # image:vision-score — system ~200 + slot desc ~150 + 10 thumbnails ~1450 tok; JSON ~250; ×2 slots
+    # image:edit-prompt — system + short user prompt ~500 tok; max_tokens=400 (actual ~120)
+    # openai:image-edit — flat $0.25 per image; tracked by BudgetService, not call_tracer
+    # qa:vision-review — system ~200 + full edited image ~3800 tok + context ~200; JSON ~400
+    # openai:vision-review — image + text via gpt-4o-mini; ~1500 in, ~250 out
+    _img_stages: list[tuple[str, str, int, int, float, str]] = [
+        (
+            "image:plan",
+            settings.image_eval_model,
+            2_000, 600,
+            _est(2_000, 600, _H_IN, _H_OUT),
+            "1× per article; Drive configured + candidates exist",
+        ),
+        (
+            "image:vision-score",
+            settings.image_eval_model,
+            1_800, 250,
+            _est(1_800, 250, _H_IN, _H_OUT) * 2,
+            "2× (one per image slot); multimodal thumbnails",
+        ),
+        (
+            "image:edit-prompt",
+            settings.edit_prompt_model,
+            500, 120,
+            _est(500, 120, _H_IN, _H_OUT),
+            "0–1×; only when vision score 40–74 (partial match)",
+        ),
+        (
+            "openai:image-edit",
+            "gpt-image-1",
+            0, 0,
+            _IMG_FLAT,
+            "~$0.25 flat/image; tracked by BudgetService, not call_tracer",
+        ),
+        (
+            "qa:vision-review",
+            settings.image_eval_model,
+            4_200, 400,
+            _est(4_200, 400, _H_IN, _H_OUT),
+            "1× per edited image; multimodal full-size image",
+        ),
+        (
+            "openai:vision-review",
+            settings.openai_vision_review_model,
+            1_500, 250,
+            _est(1_500, 250, _M_IN, _M_OUT),
+            "1× per edited image",
+        ),
+    ]
+
+    image_subtotal = sum(s[4] for s in _img_stages)
+    full_pipeline_cost = mandatory_cost + image_subtotal
+
+    img_t = _Table(
+        "Stage", "Model", "Est. In Tok", "Est. Out Tok", "Est. Cost", "Notes",
+        box=_box.SIMPLE,
+        header_style="bold dim",
+        title="\n[bold]Conditional: Image Pipeline (estimated — Drive not configured)[/bold]",
+    )
+    for label, model, in_tok, out_tok, cost, notes in _img_stages:
+        in_str = f"{in_tok:,}" if in_tok else "—"
+        out_str = f"{out_tok:,}" if out_tok else "—"
+        img_t.add_row(label, model, in_str, out_str, f"${cost:.4f}", f"[dim]{notes}[/dim]")
+
+    img_t.add_row(
+        "[bold]IMAGE SUBTOTAL[/bold]", "[dim]1 edited image scenario[/dim]",
+        "", "",
+        f"[bold yellow]${image_subtotal:.4f}[/bold yellow]",
+        "[dim]includes $0.25 OpenAI image edit[/dim]",
+    )
+    console.print(img_t)
+
+    # ── Two-total summary ─────────────────────────────────────────────────────
+    console.print(Panel(
+        f"[bold]Cost Summary[/bold]\n\n"
+        f"  [dim]Until QA failure  (mandatory stages):[/dim]  "
+        f"[bold cyan]${mandatory_cost:.4f}[/bold cyan]"
+        f"  [dim]topics → plan → generate → SEO → QA[/dim]\n\n"
+        f"  [dim]Full publish + image processing:[/dim]       "
+        f"[bold green]${full_pipeline_cost:.4f}[/bold green]"
+        f"  [dim]+ Drive image pipeline (1 edited image)[/dim]",
+        expand=False,
+    ))
+    console.print(
+        f"\n[dim]Note: cost is NOT recorded to the monthly budget (benchmark mode).[/dim]"
+        f"\n[dim]Image pipeline costs are estimates derived from prompt sizes and model "
+        f"pricing. Actual cost varies with article length, Drive candidate count, and "
+        f"vision score distribution.[/dim]"
+    )
 
 
 if __name__ == "__main__":

@@ -66,3 +66,16 @@ class SiteProfile(BaseModel):
             "Websites with the same client_id can always share content regardless of this field."
         ),
     )
+
+    # ── Cortex identity ───────────────────────────────────────────────────────
+
+    canonical_client: str | None = Field(
+        default=None,
+        description=(
+            "Canonical client identifier for Cortex joins. "
+            "Maps this site to a single normalized business entity, enabling "
+            "cross-site reporting without relying on free-text client_id strings. "
+            "Required for publishing — runs without it are blocked at publish time. "
+            "Example: 'overhead-door-network'."
+        ),
+    )
