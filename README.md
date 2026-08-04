@@ -53,9 +53,18 @@ SEO Agent is a multi-client, multi-site article generation and publishing pipeli
 - **Per-article cost target**: Warning printed when cost exceeds `max_article_cost_usd` (default: $0.25).
 - **File-locked writes**: POSIX exclusive lock on budget JSON prevents corruption under concurrent runs.
 
+### BigQuery Analytics
+
+- **Fire-and-forget sink**: Every published article writes rows to three BigQuery tables — `articles_published`, `qa_results`, `llm_costs`. Failures are logged and never interrupt publishing.
+- **Canonical client identity**: `canonical_client` field in `site.json` maps any site to a normalized business entity for cross-site Cortex reporting. Publishing is blocked if this field is missing.
+- **Full cost traceability**: Each LLM call is recorded with model, provider, stage, token counts, and cost — joinable to articles via `article_id`.
+- **Prompt version tracking**: `PROMPT_VERSION` constant in `article_agent.py` is written to every article row. Bump it when the generation prompt changes.
+- **Health check command**: `python main.py test-bigquery` validates credentials, schema, read/write, and streaming buffer — with per-section timing and verbose mode.
+- **Credentials**: BigQuery credentials come exclusively from `GOOGLE_APPLICATION_CREDENTIALS` (service account JSON). No other credential path is supported.
+
 ### Multi-Client Architecture
 
-- **Site profiles**: Per-client, per-website JSON configs with business name, service, city, WordPress credentials, and Drive settings.
+- **Site profiles**: Per-client, per-website JSON configs with business name, service, city, WordPress credentials, Drive settings, and `canonical_client` for Cortex reporting.
 - **Tenant isolation**: All articles, budgets, and output are namespaced by `client_id / website_id`.
 - **Model routing**: Each pipeline stage (generation, planning, SEO, QA, image eval) has an independently configurable model.
 
@@ -68,14 +77,20 @@ seo-agent/
 │
 ├── agents/                  # AI agents (article, QA, image resolver)
 ├── budget/                  # Monthly budget JSON files
-├── docs/                    # Development log
+├── docs/
+│   ├── bq_schema.sql        # BigQuery DDL for all three tables
+│   └── dev-log.md           # Engineering session log
 ├── models/                  # Pydantic data models
 ├── output/articles/         # Generated article JSON + media
 ├── profiles/                # Per-client site profiles
-│   └── {client}/{website}/site.json
-├── services/                # Core service layer
+│   └── {client}/{website}/
+│       ├── site.json        # Business metadata + canonical_client
+│       └── visual_style.json
+├── services/
+│   ├── bq_sink_service.py   # BigQuery fire-and-forget sink
+│   └── ...                  # Other service layer modules
 ├── templates/               # Article structure spec
-├── tests/                   # pytest test suite
+├── tests/                   # pytest test suite (241 tests)
 │
 ├── config.py                # Settings (Pydantic BaseSettings, .env)
 ├── main.py                  # CLI entry point (Typer)
@@ -93,6 +108,9 @@ pip install -r requirements.txt
 # Configure environment
 cp .env.example .env
 # Set: ANTHROPIC_API_KEY, OPENAI_API_KEY, and per-site WP/Drive credentials
+
+# BigQuery (optional but required for analytics)
+export GOOGLE_APPLICATION_CREDENTIALS=/path/to/service-account.json
 ```
 
 ### Dependencies
@@ -105,6 +123,7 @@ cp .env.example .env
 | `rich` | Terminal output formatting |
 | `pydantic` / `pydantic-settings` | Data models and config |
 | `google-api-python-client` | Google Drive integration |
+| `google-cloud-bigquery` | BigQuery analytics sink |
 | `openpyxl` | Excel export support |
 | `requests` | WordPress REST API |
 | `pytest` | Test suite |
@@ -127,6 +146,12 @@ python main.py suggest --client RIMC --website overheaddoornwi --service "Overhe
 # Publish a previously generated article
 python main.py publish --client RIMC --website overheaddoornwi \
   --article output/articles/RIMC/overheaddoornwi/article-slug/article.json
+
+# Validate BigQuery connectivity and schema
+python main.py test-bigquery
+
+# Verbose health check (shows raw row data)
+python main.py test-bigquery --verbose
 ```
 
 ---
@@ -181,10 +206,16 @@ Key settings:
 - [x] Budget file locking
 - [x] Per-article cost target and warnings
 
-### Phase 5 — Quality and Scale
+### Phase 5 — Observability ✅
 
-- [ ] Fix QA cost attribution bug (`dual_qa_agent.py:555`)
-- [ ] Track OpenAI text review costs
+- [x] BigQuery sink — articles_published, qa_results, llm_costs
+- [x] Canonical client identity (`canonical_client` in site.json)
+- [x] Prompt version traceability (`PROMPT_VERSION` constant)
+- [x] Per-article cost breakdown by provider in BQ
+- [x] BigQuery health check command (`test-bigquery`)
+
+### Phase 6 — Quality and Scale
+
 - [ ] Integrate `writing_audit_service.py` into pipeline
 - [ ] Google Search Console integration
 - [ ] Keyword clustering and topic planning
@@ -197,6 +228,7 @@ Key settings:
 | Document | Description |
 |---|---|
 | [`docs/dev-log.md`](docs/dev-log.md) | Engineering session log |
+| [`docs/bq_schema.sql`](docs/bq_schema.sql) | BigQuery DDL for all three tables |
 | [`CHANGELOG.md`](CHANGELOG.md) | Feature and fix history |
 | [`PROJECT_STATUS.md`](PROJECT_STATUS.md) | Live sprint status and blockers |
 
