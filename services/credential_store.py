@@ -1,8 +1,9 @@
 import json
 import logging
 from pathlib import Path
+from urllib.parse import urlparse
 
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError, field_validator
 
 logger = logging.getLogger(__name__)
 
@@ -28,7 +29,7 @@ class WordPressCredentials(BaseModel):
     Loaded from credentials/{client_id}/{website_id}.json.
     Never read from environment variables — each site has its own file.
     """
-    url: str = Field(description="WordPress site URL, e.g. 'https://tu-sitio.com'.")
+    url: str = Field(description="WordPress site URL. Must use HTTPS, e.g. 'https://example.com'.")
     user: str = Field(description="WordPress username with publish permissions.")
     app_password: str = Field(
         description="WordPress Application Password (Settings → Your Profile)."
@@ -40,6 +41,22 @@ class WordPressCredentials(BaseModel):
             "exist in WordPress. Null means publish without a category."
         ),
     )
+
+    @field_validator("url")
+    @classmethod
+    def _require_https(cls, v: str) -> str:
+        parsed = urlparse(v)
+        if parsed.scheme != "https" or not parsed.netloc:
+            raise ValueError(
+                f"WordPress URL must use HTTPS.\n"
+                f"    Got:  {v!r}\n"
+                f"    ✓  https://example.com\n"
+                f"    ✗  http://example.com\n"
+                f"    ✗  example.com  (missing scheme)\n"
+                f"    ✗  (empty string)\n"
+                f"Update the 'url' field in the credential file to use HTTPS."
+            )
+        return v
 
 
 # ── Store ─────────────────────────────────────────────────────────────────────
