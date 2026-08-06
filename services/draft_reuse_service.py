@@ -22,6 +22,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from services.topic_normalization import apply_synonyms
+
 if TYPE_CHECKING:
     from models.article import Article, ArticleRequest
     from models.tenant import TenantContext
@@ -41,8 +43,12 @@ _STOPWORDS = frozenset({
 
 
 def _tokenize(text: str) -> frozenset[str]:
-    words = re.findall(r"[a-z]+", text.lower())
-    return frozenset(w for w in words if w not in _STOPWORDS and len(w) > 2)
+    result: set[str] = set()
+    for w in re.findall(r"[a-z]+", text.lower()):
+        canonical = apply_synonyms(w)
+        if canonical not in _STOPWORDS and len(canonical) > 2:
+            result.add(canonical)
+    return frozenset(result)
 
 
 def _jaccard(a: frozenset[str], b: frozenset[str]) -> float:

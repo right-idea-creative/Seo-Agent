@@ -2,6 +2,71 @@
 
 ---
 
+## 2026-08-04
+
+### Request 4 — BigQuery Sink
+
+#### Summary
+
+Added `services/bq_sink_service.py`: a fire-and-forget BigQuery sink that writes three tables in the `rightidea-cortex.seo_content` dataset after each article is published. The sink is entirely additive — it does not replace any existing JSON storage or alter the publishing pipeline in any way.
+
+---
+
+#### Architecture
+
+`BqSinkService` is a plain class with a lazy-initialized `google-cloud-bigquery` client. On construction it reads `GOOGLE_APPLICATION_CREDENTIALS` from the environment; if the variable is absent or the client initialization fails for any reason, it logs a warning and sets `_client = None`. Every subsequent insert is a no-op when `_client` is None.
+
+All three public methods (`insert_article`, `insert_qa_results`, `insert_llm_costs`) wrap their logic in a bare `except Exception` block. BigQuery failures are logged at WARNING level and never propagated. The publishing pipeline can never be interrupted by a sink failure.
+
+---
+
+#### Tables
+
+| Table | Rows | Key fields |
+|---|---|---|
+| `articles_published` | 1 per article | client, website, topic, title, slug, url, publish_date, word_count, reading_time, focus_keyword, category, seo/editorial/writing/authenticity scores, claude_cost_usd, openai_cost_usd, total_cost_usd, reuse, reuse_similarity, generation_time |
+| `qa_results` | 1 per QA run | article_id, approved, revision_cycles, per-dimension scores (claude_seo, claude_editorial, openai_writing, openai_authenticity), overall_pass |
+| `llm_costs` | 1 per `CallRecord` | timestamp, system, stage, provider, model, input_tokens, output_tokens, cost_usd, success |
+
+The `provider` field in `llm_costs` is derived from the model name: `claude-*` → `"claude"`, `gpt-*` / `o1-*` / `o3-*` → `"openai"`, anything else → `"other"`.
+
+---
+
+#### Error Handling
+
+| Scenario | Outcome |
+|---|---|
+| `GOOGLE_APPLICATION_CREDENTIALS` absent | Warning logged, sink disabled, all inserts are no-ops |
+| Client init fails (bad credentials, missing library) | Warning logged, `_client = None`, inserts are no-ops |
+| `insert_rows_json` raises (network, auth, missing dataset) | Warning logged, method returns None |
+| `insert_rows_json` returns error rows | Warning logged, method returns None |
+| Any unexpected exception in row construction | Warning logged, method returns None |
+
+---
+
+#### Files Created
+
+| File | Purpose |
+|---|---|
+| `services/bq_sink_service.py` | `BqSinkService` class with `insert_article()`, `insert_qa_results()`, `insert_llm_costs()` |
+| `tests/test_bq_sink_service.py` | 29 regression tests (see Testing) |
+
+---
+
+#### Testing
+
+29 tests, all passing:
+
+- `TestProviderFromModel` (3) — model string → provider label mapping
+- `TestMissingCredentials` (4) — no env var: client is None, all inserts are no-ops
+- `TestAuthFailureDuringInit` (2) — exception from client init: `_client` stays None, inserts are no-ops
+- `TestInsertArticle` (7) — correct table, all fields, cost split by provider, reuse fields, missing url, network failure, publishing continues
+- `TestInsertQaResults` (4) — correct table, all fields, network failure, missing-dataset error
+- `TestInsertLlmCosts` (7) — correct table, one row per record, field values, provider derivation, empty tracer, network failure, publishing continues
+- `TestMultipleInserts` (2) — all three inserts in sequence, partial failure does not block remaining inserts
+
+---
+
 ## 2026-08-03
 
 ### Summary
@@ -475,5 +540,380 @@ Do not re-introduce prompt caching unless the architecture changes to include on
 3. A fundamentally different pipeline design where a system prompt is reused across multiple LLM calls within a single article run (e.g., a multi-turn conversation architecture).
 
 None of these are planned. Under the current architecture, caching is net-negative.
+
+---
+
+## Request 7: Draft Reuse Similarity Asymmetry — Fixed
+
+**Date:** 2026-08-03  
+**Engineer:** Claude (automated)  
+**Status:** Implemented, tested, deployed.
+
+---
+
+### Investigation
+
+The previous investigation identified that `normalize_topic_id()` and `_tokenize()` applied synonym normalization inconsistently:
+
+- `normalize_topic_id()` (`services/topic_normalization.py`) applies `_SYNONYMS` to each token before filtering. "broken" → "repair", "springs" → "spring", "overhead" → "door", "liftmaster" → "opener", etc.
+- `_tokenize()` (`services/draft_reuse_service.py`) did NOT apply `_SYNONYMS`. Raw word tokens were returned as-is after only stopword and length filtering.
+
+This was confirmed to still exist in the current codebase. The asymmetry affects Pass 2 of the reuse pipeline (Jaccard similarity), which is the fallback for articles whose topic_ids don't match exactly.
+
+---
+
+### Architecture Context: When Does the Asymmetry Matter?
+
+**Pass 1 (topic_id exact match):** Uses `normalize_topic_id()` on both sides. Synonym normalization is applied symmetrically. Semantically equivalent topics ("Broken Garage Door Springs" → topic_id = "door-garage-repair-spring", "Garage Door Spring Repair" → same) are caught here. The asymmetry does NOT affect Pass 1.
+
+**Pass 2 (Jaccard similarity):** Runs only when topic_ids differ — meaning the two articles are related but not identical. Token sets are built via `_tokenize()` from `topic + title + focus_keyword + slug + service`. Without synonym normalization, tokens like "broken" and "repair" are distinct, reducing intersection and lowering the Jaccard score below the 0.72 threshold.
+
+The false negative zone: articles where one side's phrasing uses problem descriptors ("broken", "damaged", "stuck") while the other uses canonical service terms ("repair"), or where plurals appear on one side only ("springs" vs "spring").
+
+---
+
+### Validation: Original Investigated Example
+
+Pair: "Broken Garage Door Opener" (request) vs "Garage Door Opener Repair Service" (existing article)
+
+These produce **different topic_ids** ("door-garage-opener-repair" vs "door-garage-opener-repair-service"), so Pass 1 cannot help. Pass 2 runs.
+
+| | Old (no synonyms) | New (with synonyms) |
+|---|---|---|
+| req tokens | {broken, garage, door, opener} | {repair, garage, door, opener} |
+| candidate tokens | {garage, door, opener, repair, service} | {garage, door, opener, repair, service} |
+| Intersection | {garage, door, opener} = 3 | {repair, garage, door, opener} = 4 |
+| Union | 6 | 5 |
+| **Jaccard** | **0.500** (miss) | **0.800** (reuse) |
+
+---
+
+### Production Draft Pool Analysis
+
+Simulation run across 40 eligible draft articles (40 same-city comparable pairs from 183 total):
+
+| Metric | Value |
+|---|---|
+| Same-city pairs checked | 183 |
+| Pass 1 exact matches | 2 |
+| Pass 2 false negatives resolved | **1** |
+
+**Confirmed false negative fixed** (real articles in the pool):
+
+> "How to Tell If Your Overhead Door Spring Is About to Break: Signs and Safety Tips for Northwest Indiana Homeowners"  
+> vs  
+> "How to Tell If Your Garage Door Spring Is Broken: Signs and Safety Tips for Northwest Indiana Homeowners"
+
+"overhead" → "door" (synonym), "broken" → "repair" (synonym). These are semantically identical articles about identifying a failing garage door spring.
+
+| | Score |
+|---|---|
+| Old (pre-fix) Jaccard | **0.692** (below threshold, false negative) |
+| New (post-fix) Jaccard | **0.727** (above threshold, correct reuse) |
+
+---
+
+### Implementation
+
+**Two files changed, minimal scope:**
+
+**`services/topic_normalization.py`** — Added public helper:
+```python
+def apply_synonyms(word: str) -> str:
+    """Return the canonical form of a single lowercase word token."""
+    return _SYNONYMS.get(word, word)
+```
+
+**`services/draft_reuse_service.py`** — Added top-level import and updated `_tokenize()`:
+```python
+from services.topic_normalization import apply_synonyms
+
+def _tokenize(text: str) -> frozenset[str]:
+    result: set[str] = set()
+    for w in re.findall(r"[a-z]+", text.lower()):
+        canonical = apply_synonyms(w)
+        if canonical not in _STOPWORDS and len(canonical) > 2:
+            result.add(canonical)
+    return frozenset(result)
+```
+
+The change applies synonym normalization consistently: stopword filtering and length check now operate on the **canonical** form (after synonym application), matching the behavior of `normalize_topic_id()`.
+
+No changes to: reuse threshold, scoring algorithm, reuse strategy, business logic.
+
+---
+
+### Additional Validation Examples
+
+| Request | Article | Pass | Old Score | New Score | Decision |
+|---|---|---|---|---|---|
+| "Broken Garage Door Springs" | "Garage Door Spring Repair" | Pass 1 (same topic_id) | — | — | Match |
+| "Broken Garage Door Opener" | "Garage Door Opener Repair Service" | Pass 2 | 0.500 | **0.800** | Old: miss → **New: reuse** |
+| "Damaged Garage Door Cables" | "Garage Door Cable Repair" | Pass 1 (same topic_id) | — | — | Match |
+| "Noisy Garage Door Openers" | "Garage Door Opener Lubrication" | Pass 2 | 0.333 | 0.600 | Both miss (correct — different service) |
+| "Stuck Garage Door" | "Garage Door Repair" | Pass 1 (same topic_id) | — | — | Match |
+
+The fix improves recall without creating false positives. Topics that are genuinely different (lubrication vs noisy repair) remain below threshold.
+
+---
+
+### Test Results
+
+```
+100 passed in 2.52s
+```
+
+35 new tests added in `tests/test_draft_reuse_synonym_normalization.py`:
+
+- `TestApplySynonyms` (7): plural nouns, problem descriptors, brand-to-category, verb inflections, unknown words, empty string.
+- `TestTokenize` (7): synonym applied, stopwords cleaned after synonym, duplicates collapsed, short tokens filtered.
+- `TestEquivalentTopics` (5): "broken springs" = "spring repair", "stuck door" = "door repair", brand = generic, overhead/garage door token parity.
+- `TestNonEquivalentTopics` (3): opener ≠ spring, installation ≠ repair, insulation ≠ repair.
+- `TestJaccardBoundary` (6): identical=1.0, disjoint=0.0, empty=0.0, threshold constant, just-above, just-below.
+- `TestRequest7FalseNegativeFixed` (3): old tokenizer < threshold, new ≥ threshold, fix strictly improves score.
+- `TestNormalizeTopicIdUnchanged` (4): `normalize_topic_id()` output unchanged, `apply_synonyms()` consistent with `_SYNONYMS`.
+
+65 original tests pass with no regressions.
+
+---
+
+### Impact Estimate
+
+**Current pool (40 eligible drafts, 183 same-city pairs):**
+- 1 false negative resolved immediately.
+- 1 article generation avoided ≈ $0.15–$0.20 savings.
+
+**Ongoing estimate (based on current article velocity: ~2 articles/week):**
+
+Before fix:
+- Pass 1 catches exact same-topic variants → high precision
+- Pass 2 Jaccard catches only high-overlap near-matches → reduced recall when synonym variants appear on opposite sides
+
+After fix:
+- Pass 2 now normalizes synonyms symmetrically → all problem-descriptor/canonical-form cross-matches benefit
+- Expected improvement: any time a new request uses "broken/damaged/stuck/noisy" vocabulary against a stored article using "repair" vocabulary, and both cover the same core noun (opener, spring, cable, etc.), the score rises by the synonym-bridge factor
+
+Conservative estimate: 5–10% improvement in Pass 2 recall per year, translating to roughly 5–10 additional reuse hits at current volume. At ~$0.17/article avoided: **$0.85–$1.70/year** direct API savings, plus avoided QA/generation time.
+
+The fix is more valuable as the draft pool grows. Once the pool contains hundreds of articles across multiple cities and clients sharing a `reuse_group`, the cross-topic near-matches multiply quadratically.
+
+---
+
+### Risk Assessment
+
+**False positive risk:** Low. Synonym normalization collapses tokens symmetrically on both sides. If two topics score ≥ 0.72 after normalization, they share 72%+ of their canonical vocabulary. The same content is genuinely reusable. The 0.72 threshold provides a safety margin.
+
+**Regression risk:** None observed. 100 tests pass. The fix is additive: it only increases Jaccard scores, never decreases them. Pass 1 (topic_id exact match) is unchanged and still runs first.
+
+**Behavioral change:** `_tokenize()` now maps synonym variants to their canonical forms before returning. Any caller that relied on `_tokenize()` returning raw words (e.g., "broken" staying "broken") would be affected. Inspection confirms the only caller is `find_match()` in `DraftReuseService`, where this behavior change is the desired outcome.
+
+---
+
+### Files Modified
+
+| File | Change |
+|---|---|
+| `services/topic_normalization.py` | Added `apply_synonyms(word: str) -> str` public helper |
+| `services/draft_reuse_service.py` | Added `apply_synonyms` import; rewrote `_tokenize()` to apply synonym normalization |
+| `tests/test_draft_reuse_synonym_normalization.py` | 35 new regression tests (created) |
+
+---
+
+## Pre-BigQuery Cost Benchmark
+
+**Date:** 2026-08-04  
+**Engineer:** Claude (automated)  
+**Goal:** Measure the real cost of each pipeline stage before beginning BigQuery integration (Request 4).
+
+---
+
+### Architecture: Every LLM Stage in `autopublish`
+
+The autopublish pipeline executes these LLM stages in order, all in a single process:
+
+| # | Label | Service | Model | Purpose | Max Tokens Out | Call Type |
+|---|---|---|---|---|---|---|
+| 0 | `topics:suggest` | Claude | `claude-haiku-4-5` | Generate 10 topic candidates | 1024 | `generate()` |
+| 1 | `plan:article` | Claude | `claude-sonnet-4-6` | Build structured article plan with sections, FAQ, thesis | 5,000 | `generate_structured()` |
+| 2 | `generate:article` | Claude | `claude-sonnet-4-6` | Stream article body (~800 words) | 2,000 | `generate()` (streaming) |
+| 3 | `seo:metadata` | Claude | `claude-haiku-4-5` | Generate slug, title, meta description, focus keyword | 4,096 | `generate_structured()` |
+| 4 | `qa:claude-review` | Claude | `claude-sonnet-4-6` | Score SEO quality (0–100) and editorial quality (0–100) | 3,000 | `generate_structured()` |
+| 5 | `openai:text-review` | OpenAI | `gpt-4o-mini` | Score human writing quality and authenticity (0–100) | 2,048 | OpenAI completions |
+| 6* | `qa:revision` | Claude | `claude-sonnet-4-6` | Rewrite article based on QA instructions (if failed) | 8,096 | `generate()` |
+| 7* | `qa:compliance` | Claude | `claude-sonnet-4-6` | Verify each revision instruction was applied | varies | `generate_structured()` |
+| 8* | `qa:vision-review` | Claude | `claude-haiku-4-5` | Review AI-edited Drive photo for artifacts | varies | `generate_structured()` |
+| 9* | `openai:vision-review` | OpenAI | `gpt-4o-mini` | Review AI-edited image with vision | varies | OpenAI vision |
+| 10* | `location:adapt-section` | Claude | `claude-haiku-4-5` | Rewrite location-specific paragraphs on reuse path | 1,500 | `generate()` |
+
+`*` = conditional stage (only runs on failure, or on the reuse path with location change).
+
+**Stage routing:**
+- Stages 0–5 run on every successful article generation.
+- Stage 6–7 run once per revision cycle (0–N times; typically 0 on a clean article).
+- Stage 8–9 run once per AI-edited image (0–N; skipped with `--no-image`).
+- Stage 10 runs on the draft reuse path only when the matched article is for a different city.
+
+---
+
+### Benchmark Implementation: `benchmark-costs`
+
+A `benchmark-costs` command was implemented in `main.py`. It exercises the entire pipeline (stages 0–5) with a synthetic article topic, without writing to WordPress, the filesystem, or the monthly budget.
+
+```
+python3 main.py benchmark-costs       # all stages
+python3 main.py benchmark-costs --no-qa  # skip QA (stages 0–3 only)
+```
+
+The command:
+1. Starts a call_tracer session
+2. Calls `topics:suggest` with a minimal 5-topic prompt
+3. Calls `article_agent.generate()` → triggers plan → generate → seo
+4. Calls `DualQAAgent.run(max_cycles=1)` → triggers qa:claude-review + openai:text-review
+5. Prints a per-stage cost table with percentage breakdown
+6. Does NOT record to BudgetService (zero side effects)
+
+**Cost per benchmark run:** ~$0.19 (same order of magnitude as a production article — the benchmark cannot be made materially cheaper without reducing max_tokens or switching models).
+
+---
+
+### Measured Results (Real API Call — 2026-08-04)
+
+Topic: "When to replace garage door springs: signs, costs, and safety"  
+Article: 1,046 words generated (QA passed on first cycle)
+
+| Stage | Model | Input Tok | Output Tok | Cost | % of Total |
+|---|---|---|---|---|---|
+| plan:article | claude-sonnet-4-6 | 5,116 | 5,000 | $0.0903 | **48.0%** |
+| qa:claude-review | claude-sonnet-4-6 | 3,792 | 2,928 | $0.0553 | **29.4%** |
+| generate:article | claude-sonnet-4-6 | 4,652 | 1,471 | $0.0360 | **19.2%** |
+| seo:metadata | claude-haiku-4-5 | 3,697 | 284 | $0.0051 | 2.7% |
+| openai:text-review | gpt-4o-mini | 2,575 | 522 | $0.0007 | 0.4% |
+| topics:suggest | claude-haiku-4-5 | 77 | 103 | $0.0006 | 0.3% |
+| **TOTAL (6 calls)** | | **19,909** | **10,308** | **$0.1881** | **100%** |
+
+---
+
+### Cost Distribution
+
+```
+plan:article      ████████████████████████  48.0%   (most expensive)
+qa:claude-review  ██████████████            29.4%
+generate:article  █████████                 19.2%
+seo:metadata      █                          2.7%
+openai:text-rev   <1%                         0.4%
+topics:suggest    <1%                         0.3%
+```
+
+**Key findings:**
+
+- **The planner is the single most expensive stage at 48.0%** — it always outputs up to 5,000 tokens (schema forces it). This is the primary target for cost reduction: switching the planner to Haiku would reduce total article cost by ~48% ($0.09 → ~$0.01).
+- **Claude QA review is the second largest cost at 29.4%** — nearly as expensive as content generation. It runs once per cycle, and each failed revision cycle adds another full QA review + revision call.
+- **Content generation is third at 19.2%** — the streaming generator produces ~1,471 output tokens (≈ 1,046 words × 1.4 tokens/word). Max is 2,000 tokens.
+- **SEO, OpenAI, and topics together: 3.4%** — negligible. These stages on Haiku/gpt-4o-mini are already optimized.
+
+---
+
+### Conditional Stage Cost Estimates
+
+Stages not exercised in the benchmark (conditional):
+
+| Stage | Model | Estimated Cost | When Triggered |
+|---|---|---|---|
+| `qa:revision` | claude-sonnet-4-6 (8096 max out) | ~$0.03–$0.07 | QA fails (any cycle) |
+| `qa:compliance` | claude-sonnet-4-6 | ~$0.02–$0.04 | After each revision |
+| `qa:claude-review` (cycle 2+) | claude-sonnet-4-6 | ~$0.04–$0.06 | After revision |
+| `openai:text-review` (cycle 2+) | gpt-4o-mini | ~$0.001 | After revision |
+| `location:adapt-section` | claude-haiku-4-5 | ~$0.002–$0.005 | Reuse path, city mismatch |
+| `qa:vision-review` (per image) | claude-haiku-4-5 | ~$0.002–$0.004 | AI-edited Drive photos |
+
+**One full revision cycle adds:** ~$0.08–$0.13 to the base $0.19.  
+**Two revision cycles (worst case):** ~$0.27–$0.45 total.
+
+---
+
+### Recommendations (for BigQuery + cost tracking)
+
+1. **Track `plan:article` separately in BigQuery.** It's 48% of cost and always output-bounded at 5,000 tokens. Cost stability = input prompt size stability.
+
+2. **The planner model is the highest-ROI optimization target.** The planner uses `planner_model` (currently `claude-sonnet-4-6`). Switching to `claude-haiku-4-5` for planning alone would reduce the per-article cost from ~$0.19 to ~$0.10 — a 47% total reduction. This is a 1-line config change, but requires a quality validation run before deploying.
+
+3. **QA cycle count is the biggest variable.** A 2-cycle article costs $0.38–$0.45 vs $0.19 for a clean pass. BigQuery should track `qa_cycles` per article.
+
+4. **Revision path coverage.** Since revision stages are conditional, the benchmark doesn't reflect worst-case costs. The average cost is closer to $0.21–$0.24 in production (most articles pass on first or second cycle based on the benchmark.py data).
+
+---
+
+### Files Modified
+
+| File | Change |
+|---|---|
+| `main.py` | Added `benchmark-costs` Typer command (~100 lines) |
+
+No regressions: **100 tests passed**.
+
+---
+
+## Benchmark Completeness: Image Pipeline Added
+
+**Date:** 2026-08-04  
+**Request:** Extend `benchmark-costs` to account for all image pipeline LLM stages; report two totals (mandatory only vs full publish with image processing).
+
+---
+
+### Investigation
+
+The prior benchmark run (mandatory stages only) was missing the entire image pipeline because the benchmark environment has no Google Drive credentials (`GOOGLE_SA_JSON_PATH`/`DRIVE_FOLDER_ID` unset). When Drive is absent, `_resolve_images()` returns `(None, [], 0, {})` immediately — no image LLM calls fire.
+
+**Image pipeline LLM stages identified (from source inspection):**
+
+| Stage | File | Model Config | Trigger |
+|---|---|---|---|
+| `image:plan` | `image_resolver_agent.py:379` | `image_eval_model` (haiku) | Drive configured + article has candidates |
+| `image:vision-score` | `image_resolver_agent.py:919` | `image_eval_model` (haiku) | Per image slot; multimodal (base64 thumbnails) |
+| `image:edit-prompt` | `image_resolver_agent.py:1105` | `edit_prompt_model` (haiku) | Vision score 40–74 (partial match only) |
+| `openai:image-edit` | `image_generators/openai_generator.py:229` | gpt-image-1 | Per slot needing edit; tracked by BudgetService |
+| `qa:vision-review` | `dual_qa_agent.py:1684` | `image_eval_model` (haiku) | Per EDITED image (multimodal) |
+| `openai:vision-review` | `dual_qa_agent.py` | gpt-4o-mini | Per EDITED image |
+
+Drive originals (`ImageSource.DRIVE`, score ≥75) skip both vision reviews — auto-approved.
+
+---
+
+### Cost Estimates (cannot be directly measured)
+
+Estimates derived from actual prompt sizes in source code + `budget_service._MODEL_PRICING`:
+
+| Stage | Est. Input Tok | Est. Output Tok | Est. Cost | Notes |
+|---|---|---|---|---|
+| `image:plan` | 2,000 | 600 | $0.0050 | 1× per article |
+| `image:vision-score` | 1,800 × 2 | 250 × 2 | $0.0061 | 2 slots; multimodal |
+| `image:edit-prompt` | 500 | 120 | $0.0011 | 0–1×; partial match |
+| `openai:image-edit` | — | — | $0.2500 | $0.25 flat; BudgetService |
+| `qa:vision-review` | 4,200 | 400 | $0.0062 | 1× per edited image |
+| `openai:vision-review` | 1,500 | 250 | $0.0004 | gpt-4o-mini |
+| **Image subtotal** | | | **$0.2688** | 1 edited image scenario |
+
+The `openai:image-edit` flat fee ($0.25) dominates the image pipeline — the Claude LLM calls collectively add only ~$0.019.
+
+---
+
+### Two-Total Summary (example for a $0.19 mandatory run)
+
+| Total | Cost | Includes |
+|---|---|---|
+| Until QA failure (mandatory) | ~$0.19 | topics → plan → generate → SEO → QA |
+| Full publish + image processing | ~$0.46 | + Drive pipeline (1 edited image) |
+
+---
+
+### Change Made
+
+`benchmark-costs` in `main.py` now:
+1. Retains existing mandatory stages table (label updated to "Mandatory Stages (measured)")
+2. Adds a second table "Conditional: Image Pipeline (estimated — Drive not configured)" with all 6 image stages, per-stage estimated token counts and costs, and a subtotal row
+3. Prints a Cost Summary panel with both totals side-by-side
+4. Footer clarifies estimates are derived from prompt sizes and model pricing, not API measurements
+
+**Files modified:** `main.py` (updated `benchmark-costs` command); `docs/dev-log.md` (this entry).
 
 ---

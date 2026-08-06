@@ -162,6 +162,11 @@ _SYNONYMS: dict[str, str] = {
 }
 
 
+def apply_synonyms(word: str) -> str:
+    """Return the canonical form of a single lowercase word token."""
+    return _SYNONYMS.get(word, word)
+
+
 def normalize_topic_id(topic: str, location: "Location | None" = None) -> str:
     """
     Return a stable, location-agnostic topic identifier in kebab-case.
